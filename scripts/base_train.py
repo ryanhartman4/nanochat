@@ -168,6 +168,25 @@ if resuming:
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
+# NCA Pre-Pre-Training (optional, skip if nca_steps=0 or resuming)
+if args.nca_steps > 0 and not resuming:
+    from scripts.base_train_nca import run_nca_stage
+    run_nca_stage(
+        model=model,
+        nca_data_path=args.nca_data,
+        nca_steps=args.nca_steps,
+        nca_lr=args.nca_lr,
+        nca_batch_size=args.nca_batch_size,
+        seq_len=args.max_seq_len,
+        alphabet_size=args.nca_alphabet_size,
+        ddp=ddp,
+        ddp_rank=ddp_rank,
+        ddp_world_size=ddp_world_size,
+        device=device,
+        wandb_run=wandb_run,
+    )
+
+# -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
 
 # Convert Linear layers to Float8Linear if --fp8 is set
