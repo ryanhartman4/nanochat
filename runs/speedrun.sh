@@ -65,8 +65,9 @@ python -m scripts.nca_generate --num-tokens 164000000 --seq-len 2048 \
     --alphabet-size 2 --output $NANOCHAT_BASE_DIR/nca_data &
 NCA_GEN_PID=$!
 
-# train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
-python -m scripts.tok_train
+# train the tokenizer with reduced vocab size (24K) for better gradient flow (A.2.1)
+# Down from 32768 default — attacks gradient bottleneck: D/V improves from ~0.024 to ~0.032
+python -m scripts.tok_train --vocab-size 24576
 # evaluate the tokenizer (report compression ratio etc.)
 python -m scripts.tok_eval
 

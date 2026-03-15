@@ -52,22 +52,21 @@ def test_simulate_trajectory_stochastic():
 def test_tokenize_grid_shape():
     """Tokenize a grid trajectory into a flat token sequence."""
     alphabet_size = 2
-    num_steps = 56  # 57 grids total (initial + 56 steps)
-    # Create fake trajectory: (57, alphabet, 12, 12)
-    grids = torch.zeros(num_steps + 1, alphabet_size, 12, 12)
+    num_grids = 56  # 56 complete grids (55 steps + initial)
+    # Create fake trajectory: (56, alphabet, 12, 12)
+    grids = torch.zeros(num_grids, alphabet_size, 12, 12)
     grids[:, 0, :, :] = 1.0  # all cells in state 0
     tokens = tokenize_trajectory(grids, alphabet_size)
-    # 6x6 patches per grid * 57 grids = 2052 tokens, but we need seq_len tokens
-    # The function should return a flat 1D tensor
+    # 6x6 patches per grid * 56 grids = 2016 tokens
     assert tokens.dim() == 1
-    assert tokens.shape[0] == 57 * 36  # 57 grids * 36 patches each = 2052
+    assert tokens.shape[0] == 56 * 36  # 56 grids * 36 patches each = 2016
 
 
 def test_tokenize_grid_vocab_range():
     """Token IDs should be in [0, alphabet^4)."""
     alphabet_size = 2
     nca_vocab_size = alphabet_size ** 4  # 16
-    grids = torch.zeros(57, alphabet_size, 12, 12)
+    grids = torch.zeros(56, alphabet_size, 12, 12)
     grids[:, 0, :, :] = 1.0
     tokens = tokenize_trajectory(grids, alphabet_size)
     assert tokens.min() >= 0, f"Negative token ID: {tokens.min()}"

@@ -32,10 +32,11 @@ def test_nca_layer_swap_and_restore():
     nca_vocab_size = 16
     saved = swap_to_nca_layers(model, nca_vocab_size)
 
-    # NCA layers should be smaller (padded to multiple of 64, matching GPT convention)
-    # config.vocab_size is set to padded size so forward() slice is a no-op
+    # config.vocab_size should be the TRUE NCA vocab (for correct logit slicing in forward())
+    # wte/lm_head are padded to multiple of 64 for tensor core alignment (GPT convention)
     padded_nca_vocab = ((nca_vocab_size + 63) // 64) * 64
-    assert model.config.vocab_size == padded_nca_vocab
+    assert model.config.vocab_size == nca_vocab_size, \
+        f"config.vocab_size should be {nca_vocab_size} (true vocab), got {model.config.vocab_size}"
     assert model.transformer.wte.weight.shape[0] == padded_nca_vocab
     assert model.lm_head.weight.shape[0] == padded_nca_vocab
 

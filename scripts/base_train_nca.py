@@ -51,8 +51,10 @@ def swap_to_nca_layers(model, nca_vocab_size):
     # Swap into model
     model.transformer.wte = nca_wte
     model.lm_head = nca_head
-    # Set vocab_size to padded size so forward() slice is a no-op (avoids non-contiguous .view())
-    model.config.vocab_size = padded_nca_vocab
+    # Set vocab_size to the TRUE NCA vocab (not padded). GPT.forward() slices logits
+    # to config.vocab_size — this ensures cross-entropy targets a 16-way softmax (n=2),
+    # not a 64-way softmax with 48 phantom classes.
+    model.config.vocab_size = nca_vocab_size
 
     # Swap value_embeds to NCA-sized
     head_dim = n_embd // model.config.n_head

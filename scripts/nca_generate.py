@@ -163,7 +163,12 @@ def generate_dataset(num_tokens, seq_len, alphabet_size, output_dir, min_gzip_ra
         grid_size: NCA grid size (paper uses 12)
     """
     patches_per_grid = (grid_size // 2) ** 2  # 36 for 12x12
-    steps_per_seq = seq_len // patches_per_grid  # 56 for seq_len=2048
+    # simulate_trajectory returns num_steps+1 grids (initial + steps).
+    # We want complete grids only, so compute how many grids fit in seq_len,
+    # then simulate (grids - 1) steps. E.g. seq_len=2048, 36 tok/grid:
+    # 2048 // 36 = 56 grids → 55 steps → 56 * 36 = 2016 tokens → pad 32.
+    grids_per_seq = seq_len // patches_per_grid  # 56 complete grids fit in 2048
+    steps_per_seq = grids_per_seq - 1  # 55 steps + initial = 56 grids
     num_sequences = (num_tokens + seq_len - 1) // seq_len  # ceiling division
 
     all_sequences = []
