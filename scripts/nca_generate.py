@@ -146,3 +146,69 @@ def passes_complexity_filter(tokens, min_ratio=0.50):
     compression ratio above min_ratio.
     """
     return gzip_compression_ratio(tokens) > min_ratio
+
+
+def generate_dataset(num_tokens, seq_len, alphabet_size, output_dir, min_gzip_ratio=0.50, grid_size=12):
+    """Generate a full NCA dataset.
+
+    Generates trajectories with random rules, filters by complexity, tokenizes,
+    and packs into sequences of seq_len.
+
+    Args:
+        num_tokens: Target total number of tokens to generate
+        seq_len: Sequence length per sample (should match main training, e.g. 2048)
+        alphabet_size: NCA alphabet size (2 or 4)
+        output_dir: Directory to save output
+        min_gzip_ratio: Minimum gzip compression ratio for filtering
+        grid_size: NCA grid size (paper uses 12)
+    """
+    patches_per_grid = (grid_size // 2) ** 2  # 36 for 12x12
+    steps_per_seq = seq_len // patches_per_grid  # 56 for seq_len=2048
+    num_sequences = (num_tokens + seq_len - 1) // seq_len  # ceiling division
+
+    all_sequences = []
+    generated = 0
+    rejected = 0
+
+    while generated < num_sequences:
+        rule = create_nca_rule(alphabet_size)
+        grids = simulate_trajectory(rule, alphabet_size, grid_size=grid_size, num_steps=steps_per_seq)
+        tokens = tokenize_trajectory(grids, alphabet_size)
+
+        # Truncate or pad to exact seq_len
+        if len(tokens) >= seq_len:
+            tokens = tokens[:seq_len]
+        else:
+            # Pad with zeros (padding token)
+            tokens = F.pad(tokens, (0, seq_len - len(tokens)), value=0)
+
+        if passes_complexity_filter(tokens, min_ratio=min_gzip_ratio):
+            all_sequences.append(tokens)
+            generated += 1
+        else:
+            rejected += 1
+
+    dataset = torch.stack(all_sequences)  # (num_sequences, seq_len)
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "nca_data.pt")
+    torch.save(dataset, output_path)
+    print(f"Generated {generated} sequences ({rejected} rejected by filter), saved to {output_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate NCA pre-pre-training dataset")
+    parser.add_argument("--num-tokens", type=int, required=True, help="Target number of tokens to generate")
+    parser.add_argument("--seq-len", type=int, default=2048, help="Sequence length per sample")
+    parser.add_argument("--alphabet-size", type=int, default=2, choices=[2, 4, 10], help="NCA alphabet size")
+    parser.add_argument("--output", type=str, required=True, help="Output directory")
+    parser.add_argument("--min-gzip-ratio", type=float, default=0.50, help="Minimum gzip compression ratio")
+    args = parser.parse_args()
+
+    generate_dataset(
+        num_tokens=args.num_tokens,
+        seq_len=args.seq_len,
+        alphabet_size=args.alphabet_size,
+        output_dir=args.output,
+        min_gzip_ratio=args.min_gzip_ratio,
+    )

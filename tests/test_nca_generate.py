@@ -1,6 +1,6 @@
 """Tests for NCA data generator. Run: python -m pytest tests/test_nca_generate.py -v"""
 import torch
-from scripts.nca_generate import create_nca_rule, simulate_trajectory, tokenize_trajectory, passes_complexity_filter, gzip_compression_ratio
+from scripts.nca_generate import create_nca_rule, simulate_trajectory, tokenize_trajectory, passes_complexity_filter, gzip_compression_ratio, generate_dataset
 
 
 def test_create_nca_rule_output_shape():
@@ -104,3 +104,32 @@ def test_gzip_filter_accepts_complex():
     # Random data typically has ratio > 0.8
     assert ratio > 0.50, f"Random tokens should pass filter, got ratio={ratio:.3f}"
     assert passes_complexity_filter(tokens, min_ratio=0.50)
+
+
+import os
+import tempfile
+
+
+def test_generate_dataset_produces_valid_file():
+    """Full pipeline: generate NCA dataset, save, and verify."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        generate_dataset(
+            num_tokens=4096,
+            seq_len=2048,
+            alphabet_size=2,
+            output_dir=tmpdir,
+            min_gzip_ratio=0.50,
+        )
+        # Verify output file exists
+        output_path = os.path.join(tmpdir, "nca_data.pt")
+        assert os.path.exists(output_path), f"Output file not found at {output_path}"
+
+        # Load and verify
+        data = torch.load(output_path, weights_only=True)
+        assert data.dim() == 2, f"Expected 2D tensor, got {data.dim()}D"
+        assert data.shape[1] == 2048, f"Expected seq_len=2048, got {data.shape[1]}"
+        nca_vocab = 2 ** 4  # alphabet_size^4
+        assert data.min() >= 0 and data.max() < nca_vocab, \
+            f"Token range [{data.min()}, {data.max()}] outside [0, {nca_vocab})"
+        # Should have at least 1 sequence (4096 / 2048 = 2 sequences minimum)
+        assert data.shape[0] >= 1, f"Expected at least 1 sequence, got {data.shape[0]}"
