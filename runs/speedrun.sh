@@ -64,7 +64,7 @@ DATASET_DOWNLOAD_PID=$!
 # Use --device cuda while GPUs are idle during tokenizer training
 # Override OMP_NUM_THREADS for this command only (global =1 cripples CPU conv2d)
 OMP_NUM_THREADS=8 python -m scripts.nca_generate --num-tokens 164000000 --seq-len 2048 \
-    --alphabet-size 2 --device cuda --output $NANOCHAT_BASE_DIR/nca_data &
+    --alphabet-size 4 --device cuda --output $NANOCHAT_BASE_DIR/nca_data &
 NCA_GEN_PID=$!
 
 # train the tokenizer with reduced vocab size (24K) for better gradient flow (A.2.1)
@@ -80,7 +80,7 @@ wait $NCA_GEN_PID
 wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --nca-steps=500 --nca-data=$NANOCHAT_BASE_DIR/nca_data --nca-lr=3e-4 --nca-alphabet-size=2 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --nca-steps=500 --nca-data=$NANOCHAT_BASE_DIR/nca_data --nca-lr=3e-4 --nca-alphabet-size=4 --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
 
