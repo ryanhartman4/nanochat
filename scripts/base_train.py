@@ -68,6 +68,12 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+# NCA pre-pre-training
+parser.add_argument("--nca-steps", type=int, default=0, help="NCA pre-pre-training steps (0 = skip)")
+parser.add_argument("--nca-data", type=str, default="", help="path to NCA dataset directory (from nca_generate.py)")
+parser.add_argument("--nca-lr", type=float, default=3e-4, help="AdamW learning rate for NCA phase")
+parser.add_argument("--nca-batch-size", type=int, default=32, help="per-device batch size for NCA phase")
+parser.add_argument("--nca-alphabet-size", type=int, default=2, choices=[2, 4], help="NCA alphabet size (2=16 tokens, 4=256 tokens)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
