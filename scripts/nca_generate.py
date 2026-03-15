@@ -85,3 +85,40 @@ def simulate_trajectory(rule, alphabet_size, grid_size=12, num_steps=56, tau=1e-
         grids.append(grid.squeeze(0))
 
     return torch.stack(grids)  # (num_steps+1, alphabet, H, W)
+
+
+def tokenize_trajectory(grids, alphabet_size):
+    """Convert a trajectory of one-hot grids into a flat token sequence.
+
+    Uses 2x2 non-overlapping patches. Each patch of 4 cells maps bijectively
+    to a token ID in [0, alphabet_size^4).
+
+    Mapping: token = c0 * n^3 + c1 * n^2 + c2 * n + c3
+    where c0..c3 are the cell states in the 2x2 patch (row-major) and n = alphabet_size.
+
+    Args:
+        grids: Tensor of shape (T, alphabet_size, H, W) — one-hot grid states
+        alphabet_size: Number of cell states per cell
+
+    Returns:
+        1D tensor of token IDs, length T * (H/2) * (W/2)
+    """
+    T, n, H, W = grids.shape
+    assert H % 2 == 0 and W % 2 == 0, f"Grid {H}x{W} must be even for 2x2 patches"
+
+    # Convert one-hot to cell state indices: (T, H, W)
+    cell_states = grids.argmax(dim=1)  # (T, H, W)
+
+    # Extract 2x2 patches: reshape to (T, H//2, 2, W//2, 2) then combine
+    patches = cell_states.reshape(T, H // 2, 2, W // 2, 2)
+    c0 = patches[:, :, 0, :, 0]  # top-left
+    c1 = patches[:, :, 0, :, 1]  # top-right
+    c2 = patches[:, :, 1, :, 0]  # bottom-left
+    c3 = patches[:, :, 1, :, 1]  # bottom-right
+
+    # Bijective mapping: mixed-radix encoding
+    n = alphabet_size
+    token_ids = c0 * (n**3) + c1 * (n**2) + c2 * n + c3  # (T, H//2, W//2)
+
+    # Flatten: row-major serialization
+    return token_ids.reshape(-1).long()
