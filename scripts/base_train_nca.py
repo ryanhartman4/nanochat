@@ -33,9 +33,14 @@ def swap_to_nca_layers(model, nca_vocab_size):
         'vocab_size': model.config.vocab_size,
     }
 
+    # Pad NCA vocab to multiple of 64, matching GPT.__init__ convention
+    # The model's forward() slices logits to config.vocab_size, so the lm_head
+    # and wte must use padded size while config.vocab_size stays at the true NCA vocab.
+    padded_nca_vocab = ((nca_vocab_size + 63) // 64) * 64
+
     # Create NCA-sized layers (use custom Linear for dtype-casting consistency)
-    nca_wte = nn.Embedding(nca_vocab_size, n_embd).to(device)
-    nca_head = Linear(n_embd, nca_vocab_size, bias=False).to(device)
+    nca_wte = nn.Embedding(padded_nca_vocab, n_embd).to(device)
+    nca_head = Linear(n_embd, padded_nca_vocab, bias=False).to(device)
     torch.nn.init.normal_(nca_wte.weight, mean=0.0, std=0.8)
     torch.nn.init.normal_(nca_head.weight, mean=0.0, std=0.001)
 
@@ -46,13 +51,14 @@ def swap_to_nca_layers(model, nca_vocab_size):
     # Swap into model
     model.transformer.wte = nca_wte
     model.lm_head = nca_head
-    model.config.vocab_size = nca_vocab_size
+    # Set vocab_size to padded size so forward() slice is a no-op (avoids non-contiguous .view())
+    model.config.vocab_size = padded_nca_vocab
 
     # Swap value_embeds to NCA-sized
     head_dim = n_embd // model.config.n_head
     kv_dim = model.config.n_kv_head * head_dim
     for key in list(model.value_embeds.keys()):
-        nca_ve = nn.Embedding(nca_vocab_size, kv_dim).to(device)
+        nca_ve = nn.Embedding(padded_nca_vocab, kv_dim).to(device)
         s = 3**0.5 * n_embd**-0.5
         torch.nn.init.uniform_(nca_ve.weight, -s, s)
         if COMPUTE_DTYPE != torch.float16:
@@ -122,7 +128,12 @@ def run_nca_stage(model, nca_data_path, nca_steps, nca_lr, nca_batch_size,
     # Load NCA dataset
     data_path = os.path.join(nca_data_path, "nca_data.pt")
     nca_data = torch.load(data_path, weights_only=True).to(device)
+    # Truncate sequences to model's sequence length (NCA data may be longer)
+    if nca_data.shape[1] > seq_len:
+        nca_data = nca_data[:, :seq_len]
     num_sequences = nca_data.shape[0]
+    # Clamp batch size to available sequences
+    nca_batch_size = min(nca_batch_size, num_sequences)
     print0(f"Loaded NCA data: {num_sequences} sequences, shape {nca_data.shape}")
 
     # Swap to NCA layers
@@ -146,8 +157,10 @@ def run_nca_stage(model, nca_data_path, nca_steps, nca_lr, nca_batch_size,
         indices = [(batch_start + i) % num_sequences for i in range(nca_batch_size)]
         x = nca_data[indices]  # (B, seq_len)
         # Next-token prediction: input is x[:, :-1], target is x[:, 1:]
-        inputs = x[:, :-1]
-        targets = x[:, 1:]
+        # .contiguous() needed because slicing creates non-contiguous views
+        # and GPT.forward() uses .view() which requires contiguity
+        inputs = x[:, :-1].contiguous()
+        targets = x[:, 1:].contiguous()
 
         loss = model(inputs, targets)
         loss.backward()

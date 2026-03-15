@@ -32,10 +32,12 @@ def test_nca_layer_swap_and_restore():
     nca_vocab_size = 16
     saved = swap_to_nca_layers(model, nca_vocab_size)
 
-    # NCA layers should be smaller
-    assert model.config.vocab_size == nca_vocab_size
-    assert model.transformer.wte.weight.shape[0] == nca_vocab_size
-    assert model.lm_head.weight.shape[0] == nca_vocab_size
+    # NCA layers should be smaller (padded to multiple of 64, matching GPT convention)
+    # config.vocab_size is set to padded size so forward() slice is a no-op
+    padded_nca_vocab = ((nca_vocab_size + 63) // 64) * 64
+    assert model.config.vocab_size == padded_nca_vocab
+    assert model.transformer.wte.weight.shape[0] == padded_nca_vocab
+    assert model.lm_head.weight.shape[0] == padded_nca_vocab
 
     # Restore
     restore_text_layers(model, saved)
