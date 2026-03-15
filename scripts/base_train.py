@@ -23,6 +23,7 @@ from contextlib import contextmanager
 
 import wandb
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
@@ -74,6 +75,9 @@ parser.add_argument("--nca-data", type=str, default="", help="path to NCA datase
 parser.add_argument("--nca-lr", type=float, default=3e-4, help="AdamW learning rate for NCA phase")
 parser.add_argument("--nca-batch-size", type=int, default=32, help="per-device batch size for NCA phase")
 parser.add_argument("--nca-alphabet-size", type=int, default=2, choices=[2, 4], help="NCA alphabet size (2=16 tokens, 4=256 tokens)")
+# Head avoidance (gradient bottleneck bypass)
+parser.add_argument("--head-avoidance-every", type=int, default=0, help="use proxy loss (bypass LM head) every K steps (0 = disable)")
+parser.add_argument("--head-avoidance-anneal", action="store_true", help="anneal proxy frequency: start at every-2, taper to every-K by end of training")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -418,6 +422,7 @@ if not resuming:
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
+    ce_step_count = 0 # count of normal CE steps (excludes proxy steps for EMA debias)
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
@@ -425,6 +430,7 @@ else:
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
+    ce_step_count = loop_state.get("ce_step_count", step)  # fallback for old checkpoints
     total_training_time = loop_state["total_training_time"]
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
@@ -516,6 +522,7 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
+                    "ce_step_count": ce_step_count,
                     "total_training_time": total_training_time,
                 },
             },
@@ -528,11 +535,40 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
+    # determine whether this step uses proxy loss (head avoidance)
+    use_proxy = False
+    if args.head_avoidance_every > 0:
+        if args.head_avoidance_anneal:
+            # Anneal: start at every-2 (aggressive bypass), taper to every-K
+            progress = step / max(num_iterations, 1)
+            effective_k = max(2, round(2 + (args.head_avoidance_every - 2) * progress))
+        else:
+            effective_k = args.head_avoidance_every
+        use_proxy = (step % effective_k == 0) and step > 0  # skip step 0 to get a clean initial loss
+
     # evaluate the gradient
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        if use_proxy:
+            # Head avoidance: compute proxy loss in decoder space (bypasses gradient bottleneck)
+            # Uses orig_model (uncompiled) to avoid DDP wrapper issues — orig_model shares
+            # the same Parameter objects, so grads land where the optimizer expects.
+            hidden = orig_model(x, return_hidden=True)  # (B, T, D) — no head, full-rank gradient
+            # Use lm_head weights as targets (NOT wte — model uses untied weights with different
+            # init scales). lm_head.weight[i] is the direction in D-space that the decoder
+            # associates with token i. This is the correct proxy target.
+            # Dequantize to compute dtype BEFORE indexing — when --fp8 is active, lm_head.weight
+            # is stored as FP8; indexing raw FP8 bytes and then casting gives inconsistent
+            # precision vs the actual Float8Linear forward path.
+            lm_head_w = orig_model.lm_head.weight.to(hidden.dtype)  # (V, D) — dequantized
+            target_emb = lm_head_w[y].detach()  # (B, T, D) — don't backprop into lm_head via this path
+            # Negative cosine similarity: "point hidden states toward correct decoder directions"
+            hidden_norm = F.normalize(hidden, dim=-1)
+            target_norm = F.normalize(target_emb, dim=-1)
+            loss = -(hidden_norm * target_norm).sum(dim=-1).mean()
+        else:
+            loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
@@ -540,6 +576,12 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    # After proxy steps: zero-fill None grads so the distributed optimizer's all-reduce doesn't crash.
+    # Proxy forward skips lm_head, value_embeds, etc., leaving their .grad as None.
+    if use_proxy:
+        for p in orig_model.parameters():
+            if p.grad is None and p.requires_grad:
+                p.grad = torch.zeros_like(p)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -570,8 +612,11 @@ while True:
 
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    if not use_proxy:
+        # Only update EMA on normal CE steps — proxy loss is on a different scale (cosine: [-1,0] vs CE: [0,~10])
+        ce_step_count += 1
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**max(ce_step_count, 1)) # debias using CE-only step count
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -588,7 +633,8 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    proxy_tag = " [PROXY]" if use_proxy else ""
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}{proxy_tag}")
     if step % 100 == 0:
         log_data = {
             "step": step,
