@@ -1,6 +1,6 @@
 """Tests for NCA data generator. Run: python -m pytest tests/test_nca_generate.py -v"""
 import torch
-from scripts.nca_generate import create_nca_rule, simulate_trajectory, tokenize_trajectory
+from scripts.nca_generate import create_nca_rule, simulate_trajectory, tokenize_trajectory, passes_complexity_filter, gzip_compression_ratio
 
 
 def test_create_nca_rule_output_shape():
@@ -86,3 +86,21 @@ def test_tokenize_bijective():
     t2 = tokenize_trajectory(g2, alphabet_size)
     # First token (patch at 0,0) should differ
     assert t1[0] != t2[0], "Different patches mapped to same token — not bijective"
+
+
+def test_gzip_filter_rejects_trivial():
+    """Constant trajectory (all same state) should have low compression ratio and be rejected."""
+    tokens = torch.zeros(2048, dtype=torch.long)  # all zeros — trivially compressible
+    assert not passes_complexity_filter(tokens, min_ratio=0.50), \
+        "Constant sequence should be rejected (high compressibility = low ratio)"
+
+
+def test_gzip_filter_accepts_complex():
+    """Random-looking tokens should have high compression ratio and pass."""
+    # Create a pseudo-structured sequence (not truly random, but varied)
+    torch.manual_seed(42)
+    tokens = torch.randint(0, 16, (2048,))
+    ratio = gzip_compression_ratio(tokens)
+    # Random data typically has ratio > 0.8
+    assert ratio > 0.50, f"Random tokens should pass filter, got ratio={ratio:.3f}"
+    assert passes_complexity_filter(tokens, min_ratio=0.50)

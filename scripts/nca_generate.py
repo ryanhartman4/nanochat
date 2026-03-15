@@ -122,3 +122,27 @@ def tokenize_trajectory(grids, alphabet_size):
 
     # Flatten: row-major serialization
     return token_ids.reshape(-1).long()
+
+
+def gzip_compression_ratio(tokens):
+    """Compute gzip compression ratio for a token sequence.
+
+    Returns r = compressed_size / raw_size. Lower r = more compressible = simpler.
+    """
+    # Convert tokens to bytes. Use uint8 if max value fits, else uint16.
+    np_tokens = tokens.numpy()
+    if np_tokens.max() < 256:
+        raw_bytes = np_tokens.astype('uint8').tobytes()
+    else:
+        raw_bytes = np_tokens.astype('<u2').tobytes()
+    compressed = gzip.compress(raw_bytes)
+    return len(compressed) / len(raw_bytes)
+
+
+def passes_complexity_filter(tokens, min_ratio=0.50):
+    """Return True if the token sequence passes the complexity filter.
+
+    Rejects trivial (highly compressible) sequences. Keeps sequences with
+    compression ratio above min_ratio.
+    """
+    return gzip_compression_ratio(tokens) > min_ratio
