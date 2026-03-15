@@ -61,8 +61,10 @@ python -m nanochat.dataset -n 170 &
 DATASET_DOWNLOAD_PID=$!
 
 # Kick off NCA generation in background (runs parallel with tokenizer training)
-python -m scripts.nca_generate --num-tokens 164000000 --seq-len 2048 \
-    --alphabet-size 2 --output $NANOCHAT_BASE_DIR/nca_data &
+# Use --device cuda while GPUs are idle during tokenizer training
+# Override OMP_NUM_THREADS for this command only (global =1 cripples CPU conv2d)
+OMP_NUM_THREADS=8 python -m scripts.nca_generate --num-tokens 164000000 --seq-len 2048 \
+    --alphabet-size 2 --device cuda --output $NANOCHAT_BASE_DIR/nca_data &
 NCA_GEN_PID=$!
 
 # train the tokenizer with reduced vocab size (24K) for better gradient flow (A.2.1)
