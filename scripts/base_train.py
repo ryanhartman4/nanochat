@@ -74,10 +74,10 @@ parser.add_argument("--nca-steps", type=int, default=0, help="NCA pre-pre-traini
 parser.add_argument("--nca-data", type=str, default="", help="path to NCA dataset directory (from nca_generate.py)")
 parser.add_argument("--nca-lr", type=float, default=3e-4, help="AdamW learning rate for NCA phase")
 parser.add_argument("--nca-batch-size", type=int, default=32, help="per-device batch size for NCA phase")
-parser.add_argument("--nca-alphabet-size", type=int, default=2, choices=[2, 4], help="NCA alphabet size (2=16 tokens, 4=256 tokens)")
+parser.add_argument("--nca-alphabet-size", type=int, default=10, choices=[2, 4, 10], help="NCA alphabet size (default 10 matches paper; 2=16 tokens, 4=256 tokens, 10=10000 tokens)")
 # Head avoidance (gradient bottleneck bypass)
 parser.add_argument("--head-avoidance-every", type=int, default=0, help="use proxy loss (bypass LM head) every K steps (0 = disable)")
-parser.add_argument("--head-avoidance-anneal", action="store_true", help="anneal proxy frequency: start at every-2, taper to every-K by end of training")
+parser.add_argument("--head-avoidance-start-ratio", type=float, default=0.75, help="fraction of training before proxy steps begin (default 0.75 = last 25%%)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -545,15 +545,14 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # determine whether this step uses proxy loss (head avoidance)
+    # Proxy steps bypass the LM head gradient bottleneck (Godey & Artzi 2026, arXiv:2603.10145).
+    # Delayed start: the bottleneck worsens near convergence (Prop 5), so proxy steps are
+    # most valuable late in training. Early proxy steps starve the head of CE gradients.
     use_proxy = False
     if args.head_avoidance_every > 0:
-        if args.head_avoidance_anneal:
-            # Anneal: start at every-2 (aggressive bypass), taper to every-K
-            progress = step / max(num_iterations, 1)
-            effective_k = max(2, round(2 + (args.head_avoidance_every - 2) * progress))
-        else:
-            effective_k = args.head_avoidance_every
-        use_proxy = (step % effective_k == 0) and step > 0  # skip step 0 to get a clean initial loss
+        proxy_start_step = round(args.head_avoidance_start_ratio * num_iterations)
+        if step >= proxy_start_step:
+            use_proxy = (step % args.head_avoidance_every == 0)
 
     # evaluate the gradient
     synchronize()
