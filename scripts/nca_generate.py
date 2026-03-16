@@ -4,11 +4,16 @@ NCA Data Generator for pre-pre-training.
 Generates synthetic Neural Cellular Automata trajectories as a pre-training dataset.
 Based on Han et al. 2026 (arXiv:2603.10055).
 
-Usage:
-    python -m scripts.nca_generate --num-tokens 164000000 --seq-len 2048 --alphabet-size 2 --output /path/to/output
+Two modes:
+  Epoch mode (recommended):
+    python -m scripts.nca_generate --num-rules 1000 --num-epochs 100 --output /path/to/output
+
+  Legacy token-count mode:
+    python -m scripts.nca_generate --num-tokens 164000000 --output /path/to/output
 """
 
 import os
+import json
 import gzip
 import argparse
 import torch
@@ -17,37 +22,33 @@ import torch.nn.functional as F
 
 
 class NCARule(nn.Module):
-    """NCA transition rule: 3x3 conv (circular padding) -> ReLU -> 1x1 conv.
+    """NCA transition rule matching paper architecture (Han et al. 2026).
 
-    Maps (B, alphabet_size, H, W) -> (B, alphabet_size, H, W) logits.
-    Uses circular padding internally for periodic (toroidal) boundaries.
+    3-layer design with 4-channel spatial bottleneck:
+      Conv(n_states→4, 3x3) → Conv(4→16, 1x1) → ReLU → Conv(16→n_states, 1x1)
+
+    The bottleneck forces rules to express neighborhood information through
+    4 channels, biasing toward simpler, more structured dynamics.
     """
     def __init__(self, alphabet_size, hidden_size=16):
         super().__init__()
-        self.conv1 = nn.Conv2d(alphabet_size, hidden_size, kernel_size=3, padding=0, bias=False)
-        self.conv2 = nn.Conv2d(hidden_size, alphabet_size, kernel_size=1, bias=False)
+        self.conv1 = nn.Conv2d(alphabet_size, 4, kernel_size=3, padding=0, bias=False)
+        self.conv2 = nn.Conv2d(4, hidden_size, kernel_size=1, bias=False)
+        self.conv3 = nn.Conv2d(hidden_size, alphabet_size, kernel_size=1, bias=False)
         for p in self.parameters():
             nn.init.normal_(p, std=0.5)
 
     def forward(self, grid):
         padded = F.pad(grid, (1, 1, 1, 1), mode='circular')
         x = self.conv1(padded)
-        x = F.relu(x)
         x = self.conv2(x)
+        x = F.relu(x)
+        x = self.conv3(x)
         return x
 
 
 def create_nca_rule(alphabet_size, hidden_size=16, device="cpu"):
-    """Create a random NCA transition rule as a small neural network.
-
-    Args:
-        alphabet_size: Number of possible cell states (n in the paper)
-        hidden_size: Hidden layer size in the MLP (paper uses 16)
-        device: Device to place rule on ("cpu", "cuda", etc.)
-
-    Returns:
-        NCARule module on the specified device
-    """
+    """Create a random NCA transition rule as a small neural network."""
     return NCARule(alphabet_size, hidden_size).to(device)
 
 
@@ -59,81 +60,50 @@ def simulate_trajectory(rule, alphabet_size, grid_size=12, num_steps=56, tau=1e-
     Supports batched simulation: multiple trajectories with the same rule
     run in parallel via batched conv2d.
 
-    Args:
-        rule: NCA transition rule (from create_nca_rule)
-        alphabet_size: Number of cell states
-        grid_size: Grid width/height (paper uses 12)
-        num_steps: Number of simulation steps
-        tau: Softmax temperature for stochastic sampling (paper uses 1e-3)
-        batch_size: Number of trajectories to simulate in parallel
-        device: Device for simulation tensors
-
     Returns:
         Tensor of shape (batch_size, num_steps+1, alphabet_size, grid_size, grid_size)
     """
     B = batch_size
-    # Random initial states: (B, grid_size, grid_size) indices
     state_indices = torch.randint(0, alphabet_size, (B, grid_size, grid_size), device=device)
-    grid = F.one_hot(state_indices, alphabet_size).permute(0, 3, 1, 2).float()  # (B, alphabet, H, W)
+    grid = F.one_hot(state_indices, alphabet_size).permute(0, 3, 1, 2).float()
 
-    grids = [grid]  # collect initial state: (B, alphabet, H, W)
-
+    grids = [grid]
     for _ in range(num_steps):
-        logits = rule(grid)  # (B, alphabet, H, W) — batched conv2d
-        # Stochastic sampling with temperature
-        probs = F.softmax(logits / tau, dim=1)  # (B, alphabet, H, W)
-        # Sample: reshape to (B*H*W, alphabet), sample, reshape back
-        flat_probs = probs.permute(0, 2, 3, 1).reshape(-1, alphabet_size)  # (B*H*W, alphabet)
-        samples = torch.multinomial(flat_probs, 1).squeeze(-1)  # (B*H*W,)
+        logits = rule(grid)
+        probs = F.softmax(logits / tau, dim=1)
+        flat_probs = probs.permute(0, 2, 3, 1).reshape(-1, alphabet_size)
+        samples = torch.multinomial(flat_probs, 1).squeeze(-1)
         grid = F.one_hot(samples, alphabet_size).float().reshape(B, grid_size, grid_size, alphabet_size)
-        grid = grid.permute(0, 3, 1, 2)  # (B, alphabet, H, W)
+        grid = grid.permute(0, 3, 1, 2)
         grids.append(grid)
 
-    return torch.stack(grids, dim=1)  # (B, num_steps+1, alphabet, H, W)
+    return torch.stack(grids, dim=1)
 
 
 def tokenize_trajectory(grids, alphabet_size):
-    """Convert one-hot grids into flat token sequences.
+    """Convert one-hot grids into flat token sequences using 2x2 patches.
 
-    Uses 2x2 non-overlapping patches. Each patch of 4 cells maps bijectively
-    to a token ID in [0, alphabet_size^4).
-
-    Supports both single and batched input:
-      - Single: grids shape (T, alphabet_size, H, W) -> returns (T * H/2 * W/2,)
-      - Batched: grids shape (B, T, alphabet_size, H, W) -> returns (B, T * H/2 * W/2)
-
-    Args:
-        grids: Tensor of grid states (see shapes above)
-        alphabet_size: Number of cell states per cell
-
-    Returns:
-        Token IDs tensor (1D for single, 2D for batched)
+    Each patch of 4 cells maps bijectively to a token ID in [0, alphabet_size^4).
     """
     batched = grids.dim() == 5
     if not batched:
-        grids = grids.unsqueeze(0)  # add batch dim
+        grids = grids.unsqueeze(0)
 
     B, T, n, H, W = grids.shape
     assert H % 2 == 0 and W % 2 == 0, f"Grid {H}x{W} must be even for 2x2 patches"
 
-    # Convert one-hot to cell state indices: (B, T, H, W)
     cell_states = grids.argmax(dim=2)
-
-    # Extract 2x2 patches
     patches = cell_states.reshape(B, T, H // 2, 2, W // 2, 2)
-    c0 = patches[:, :, :, 0, :, 0]  # top-left
-    c1 = patches[:, :, :, 0, :, 1]  # top-right
-    c2 = patches[:, :, :, 1, :, 0]  # bottom-left
-    c3 = patches[:, :, :, 1, :, 1]  # bottom-right
+    c0 = patches[:, :, :, 0, :, 0]
+    c1 = patches[:, :, :, 0, :, 1]
+    c2 = patches[:, :, :, 1, :, 0]
+    c3 = patches[:, :, :, 1, :, 1]
 
-    # Bijective mapping: mixed-radix encoding
     token_ids = c0 * (alphabet_size**3) + c1 * (alphabet_size**2) + c2 * alphabet_size + c3
-
-    # Flatten time and spatial dims: (B, T * H/2 * W/2)
     token_ids = token_ids.reshape(B, -1).long()
 
     if not batched:
-        return token_ids.squeeze(0)  # remove batch dim for single input
+        return token_ids.squeeze(0)
     return token_ids
 
 
@@ -141,9 +111,7 @@ def gzip_compression_ratio(tokens):
     """Compute gzip compression ratio for a token sequence.
 
     Returns r = compressed_size / raw_size. Lower r = more compressible = simpler.
-    Expects a CPU tensor (moves to CPU if needed).
     """
-    # Ensure CPU for .numpy()
     if tokens.is_cuda:
         tokens = tokens.cpu()
     np_tokens = tokens.numpy()
@@ -156,11 +124,7 @@ def gzip_compression_ratio(tokens):
 
 
 def passes_complexity_filter(tokens, min_ratio=0.50):
-    """Return True if the token sequence passes the complexity filter.
-
-    Rejects trivial (highly compressible) sequences. Keeps sequences with
-    compression ratio above min_ratio.
-    """
+    """Return True if the token sequence passes the complexity filter."""
     return gzip_compression_ratio(tokens) > min_ratio
 
 
@@ -171,32 +135,115 @@ def _resolve_device(device_str):
     return torch.device(device_str)
 
 
+def _compute_seq_params(seq_len, grid_size=12):
+    """Compute NCA simulation parameters from sequence length."""
+    patches_per_grid = (grid_size // 2) ** 2  # 36 for 12x12
+    grids_per_seq = seq_len // patches_per_grid
+    steps_per_seq = grids_per_seq - 1
+    return patches_per_grid, grids_per_seq, steps_per_seq
+
+
+def build_rule_pool(num_rules, alphabet_size, seq_len, min_gzip_ratio=0.50,
+                    grid_size=12, device="cpu"):
+    """Create a pool of complexity-filtered NCA rules.
+
+    Each rule is a small random neural network that defines unique dynamics.
+    Rules are filtered by generating a test trajectory and checking gzip complexity.
+
+    Returns:
+        List of NCARule modules, steps_per_seq
+    """
+    _, _, steps_per_seq = _compute_seq_params(seq_len, grid_size)
+
+    rules = []
+    rejected = 0
+    while len(rules) < num_rules:
+        rule = create_nca_rule(alphabet_size, device=device)
+        # Quick complexity check with one trajectory
+        grids = simulate_trajectory(rule, alphabet_size, grid_size=grid_size,
+                                    num_steps=steps_per_seq, batch_size=1, device=device)
+        tokens = tokenize_trajectory(grids, alphabet_size)[0][:seq_len]
+        if passes_complexity_filter(tokens, min_ratio=min_gzip_ratio):
+            rules.append(rule)
+        else:
+            rejected += 1
+        if (len(rules) + rejected) % 100 == 0:
+            print(f"  Rule pool: {len(rules)}/{num_rules} accepted, {rejected} rejected")
+
+    print(f"Built rule pool: {num_rules} rules ({rejected} rejected by gzip filter)")
+    return rules, steps_per_seq
+
+
+def generate_epoch_dataset(num_rules, num_epochs, seq_len, alphabet_size, output_dir,
+                           min_gzip_ratio=0.50, grid_size=12, device="auto"):
+    """Generate a structured NCA dataset: num_epochs fresh trajectories per rule.
+
+    Creates a fixed pool of rules, then generates num_epochs different trajectories
+    from each rule (different random initial states each time). This gives the model
+    fresh data each epoch while maintaining rule diversity.
+
+    Output:
+        nca_data.pt: tensor of shape (num_epochs * num_rules, seq_len)
+        nca_meta.json: {num_rules, num_epochs, seq_len, alphabet_size}
+
+    During training, epoch k = data[k*num_rules : (k+1)*num_rules].
+    """
+    device = _resolve_device(device) if isinstance(device, str) else device
+    print(f"NCA epoch generation on device: {device}")
+    print(f"Config: {num_rules} rules × {num_epochs} epochs = {num_rules * num_epochs} sequences")
+
+    # Build complexity-filtered rule pool
+    rules, steps_per_seq = build_rule_pool(
+        num_rules, alphabet_size, seq_len, min_gzip_ratio, grid_size, device)
+
+    all_sequences = []
+    epoch_rejects = 0
+    for epoch in range(num_epochs):
+        epoch_seqs = []
+        for rule in rules:
+            # Fresh trajectory: new random initial state each time
+            # Retry if this trajectory fails gzip filter (rule passed but init state may be degenerate)
+            for _attempt in range(5):
+                grids = simulate_trajectory(rule, alphabet_size, grid_size=grid_size,
+                                            num_steps=steps_per_seq, batch_size=1, device=device)
+                tokens = tokenize_trajectory(grids, alphabet_size)[0][:seq_len]
+                if passes_complexity_filter(tokens, min_ratio=min_gzip_ratio):
+                    break
+                epoch_rejects += 1
+            # Pad if needed
+            if tokens.shape[0] < seq_len:
+                tokens = F.pad(tokens, (0, seq_len - tokens.shape[0]), value=0)
+            epoch_seqs.append(tokens.cpu())
+        all_sequences.extend(epoch_seqs)
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1}/{num_epochs} generated ({len(all_sequences)} total sequences)")
+
+    dataset = torch.stack(all_sequences)  # (num_epochs * num_rules, seq_len)
+
+    os.makedirs(output_dir, exist_ok=True)
+    torch.save(dataset, os.path.join(output_dir, "nca_data.pt"))
+    meta = {"num_rules": num_rules, "num_epochs": num_epochs,
+            "seq_len": seq_len, "alphabet_size": alphabet_size}
+    with open(os.path.join(output_dir, "nca_meta.json"), "w") as f:
+        json.dump(meta, f)
+
+    total_tokens = dataset.shape[0] * dataset.shape[1]
+    print(f"Generated {dataset.shape[0]} sequences ({total_tokens/1e6:.0f}M tokens), "
+          f"saved to {output_dir} ({epoch_rejects} per-epoch gzip retries)")
+    print(f"Data size: {dataset.element_size() * dataset.nelement() / 1e6:.0f}MB")
+
+
 def generate_dataset(num_tokens, seq_len, alphabet_size, output_dir, min_gzip_ratio=0.50,
                      grid_size=12, trajectories_per_rule=128, device="auto"):
-    """Generate a full NCA dataset with batched simulation.
-
-    Creates random NCA rules, simulates multiple trajectories per rule in
-    a batched forward pass, filters by gzip complexity, and saves.
-
-    Args:
-        num_tokens: Target total number of tokens to generate
-        seq_len: Sequence length per sample (should match main training, e.g. 2048)
-        alphabet_size: NCA alphabet size (2 or 4)
-        output_dir: Directory to save output
-        min_gzip_ratio: Minimum gzip compression ratio for filtering
-        grid_size: NCA grid size (paper uses 12)
-        trajectories_per_rule: Trajectories simulated per rule (controls diversity vs speed)
-        device: Device for simulation ("auto", "cpu", "cuda")
-    """
+    """Legacy: Generate NCA dataset by token count (old interface)."""
     device = _resolve_device(device) if isinstance(device, str) else device
     print(f"NCA generation on device: {device}")
 
-    patches_per_grid = (grid_size // 2) ** 2  # 36 for 12x12
-    # We want complete grids only. E.g. seq_len=2048, 36 tok/grid:
-    # 2048 // 36 = 56 grids → 55 steps → 56 * 36 = 2016 tokens → pad 32.
+    patches_per_grid = (grid_size // 2) ** 2
     grids_per_seq = seq_len // patches_per_grid
-    steps_per_seq = grids_per_seq - 1  # simulate N-1 steps + initial = N grids
-    num_sequences = (num_tokens + seq_len - 1) // seq_len  # ceiling division
+    steps_per_seq = grids_per_seq - 1
+    num_sequences = (num_tokens + seq_len - 1) // seq_len
 
     all_sequences = []
     generated = 0
@@ -204,34 +251,21 @@ def generate_dataset(num_tokens, seq_len, alphabet_size, output_dir, min_gzip_ra
     num_rules = 0
 
     while generated < num_sequences:
-        # How many trajectories to simulate this batch
         remaining = num_sequences - generated
-        # Over-generate to account for gzip rejection (~50% acceptance)
         batch_size = min(trajectories_per_rule, remaining * 2)
-
         rule = create_nca_rule(alphabet_size, device=device)
         num_rules += 1
-
-        # Batched simulation: (B, T+1, alphabet, H, W)
         grids = simulate_trajectory(
             rule, alphabet_size, grid_size=grid_size,
             num_steps=steps_per_seq, batch_size=batch_size, device=device,
         )
-
-        # Batched tokenization: (B, T * patches_per_grid)
-        tokens_batch = tokenize_trajectory(grids, alphabet_size)  # (B, raw_tokens)
-
-        # Truncate or pad each sequence to exact seq_len
+        tokens_batch = tokenize_trajectory(grids, alphabet_size)
         raw_len = tokens_batch.shape[1]
         if raw_len >= seq_len:
             tokens_batch = tokens_batch[:, :seq_len]
         else:
             tokens_batch = F.pad(tokens_batch, (0, seq_len - raw_len), value=0)
-
-        # Move to CPU for gzip filtering (gzip needs numpy)
         tokens_cpu = tokens_batch.cpu()
-
-        # Filter each sequence individually
         for i in range(tokens_cpu.shape[0]):
             if generated >= num_sequences:
                 break
@@ -241,13 +275,11 @@ def generate_dataset(num_tokens, seq_len, alphabet_size, output_dir, min_gzip_ra
                 generated += 1
             else:
                 rejected += 1
-
         if num_rules % 10 == 0:
             print(f"Progress: {generated}/{num_sequences} sequences "
                   f"({num_rules} rules, {rejected} rejected)")
 
-    dataset = torch.stack(all_sequences)  # (num_sequences, seq_len)
-
+    dataset = torch.stack(all_sequences)
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, "nca_data.pt")
     torch.save(dataset, output_path)
@@ -257,23 +289,43 @@ def generate_dataset(num_tokens, seq_len, alphabet_size, output_dir, min_gzip_ra
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate NCA pre-pre-training dataset")
-    parser.add_argument("--num-tokens", type=int, required=True, help="Target number of tokens to generate")
+    # Epoch mode (recommended)
+    parser.add_argument("--num-rules", type=int, default=0, help="Number of unique NCA rules (epoch mode)")
+    parser.add_argument("--num-epochs", type=int, default=100, help="Trajectories per rule = training epochs")
+    # Legacy token-count mode
+    parser.add_argument("--num-tokens", type=int, default=0, help="Target tokens (legacy mode, use --num-rules instead)")
+    # Shared
     parser.add_argument("--seq-len", type=int, default=2048, help="Sequence length per sample")
-    parser.add_argument("--alphabet-size", type=int, default=2, choices=[2, 4, 10], help="NCA alphabet size")
+    parser.add_argument("--alphabet-size", type=int, default=10, choices=[2, 4, 10], help="NCA alphabet size")
     parser.add_argument("--output", type=str, required=True, help="Output directory")
     parser.add_argument("--min-gzip-ratio", type=float, default=0.50, help="Minimum gzip compression ratio")
     parser.add_argument("--trajectories-per-rule", type=int, default=128,
-                        help="Trajectories per rule (higher=faster, lower=more rule diversity)")
+                        help="Trajectories per rule (legacy mode only)")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
-                        help="Device for simulation (auto picks cuda if available)")
+                        help="Device for simulation")
     args = parser.parse_args()
 
-    generate_dataset(
-        num_tokens=args.num_tokens,
-        seq_len=args.seq_len,
-        alphabet_size=args.alphabet_size,
-        output_dir=args.output,
-        min_gzip_ratio=args.min_gzip_ratio,
-        trajectories_per_rule=args.trajectories_per_rule,
-        device=args.device,
-    )
+    if args.num_rules > 0:
+        # Epoch mode
+        generate_epoch_dataset(
+            num_rules=args.num_rules,
+            num_epochs=args.num_epochs,
+            seq_len=args.seq_len,
+            alphabet_size=args.alphabet_size,
+            output_dir=args.output,
+            min_gzip_ratio=args.min_gzip_ratio,
+            device=args.device,
+        )
+    elif args.num_tokens > 0:
+        # Legacy mode
+        generate_dataset(
+            num_tokens=args.num_tokens,
+            seq_len=args.seq_len,
+            alphabet_size=args.alphabet_size,
+            output_dir=args.output,
+            min_gzip_ratio=args.min_gzip_ratio,
+            trajectories_per_rule=args.trajectories_per_rule,
+            device=args.device,
+        )
+    else:
+        parser.error("Specify either --num-rules (epoch mode) or --num-tokens (legacy mode)")

@@ -6,6 +6,8 @@ Kept separate for testability — called from base_train.py.
 """
 
 import gc
+import json
+import math
 import os
 
 import torch
@@ -34,26 +36,19 @@ def swap_to_nca_layers(model, nca_vocab_size):
     }
 
     # Pad NCA vocab to multiple of 64, matching GPT.__init__ convention
-    # The model's forward() slices logits to config.vocab_size, so the lm_head
-    # and wte must use padded size while config.vocab_size stays at the true NCA vocab.
     padded_nca_vocab = ((nca_vocab_size + 63) // 64) * 64
 
-    # Create NCA-sized layers (use custom Linear for dtype-casting consistency)
+    # Create NCA-sized layers
     nca_wte = nn.Embedding(padded_nca_vocab, n_embd).to(device)
     nca_head = Linear(n_embd, padded_nca_vocab, bias=False).to(device)
     torch.nn.init.normal_(nca_wte.weight, mean=0.0, std=0.8)
     torch.nn.init.normal_(nca_head.weight, mean=0.0, std=0.001)
 
-    # Cast to compute dtype if needed (matching init_weights behavior)
     if COMPUTE_DTYPE != torch.float16:
         nca_wte.to(dtype=COMPUTE_DTYPE)
 
-    # Swap into model
     model.transformer.wte = nca_wte
     model.lm_head = nca_head
-    # Set vocab_size to the TRUE NCA vocab (not padded). GPT.forward() slices logits
-    # to config.vocab_size — this ensures cross-entropy targets a 16-way softmax (n=2),
-    # not a 64-way softmax with 48 phantom classes.
     model.config.vocab_size = nca_vocab_size
 
     # Swap value_embeds to NCA-sized
@@ -82,108 +77,132 @@ def restore_text_layers(model, saved):
 def transfer_nca_to_text(model, saved, ddp=False):
     """Execute NCA -> text transfer protocol.
 
-    Following Han et al. 2026: keep all transformer weights (attention + MLP + layernorm),
+    Following Han et al. 2026: keep all transformer weights (attention + MLP),
     reinit only the vocab-dependent layers (embeddings, value_embeds, scalars).
-
-    1. Deep copy all transformer block weights (attention + MLP)
-    2. All-reduce across ranks (if DDP)
-    3. Restore text-sized modules (embeddings, value_embeds)
-    4. Full reinit (resets everything to text-sized defaults)
-    5. Load NCA-trained transformer weights back (attention + MLP + layernorm)
     """
-    # 1. Deep copy all transformer block weights — attention AND MLP AND layernorm
-    # Paper ablation (Fig 5): attention is the primary transfer mechanism, but keeping
-    # MLP/layernorm is the paper's default config that produced headline results.
+    # Deep copy all transformer block weights — attention AND MLP
     block_state = {k: v.clone() for k, v in model.state_dict().items()
                    if '.attn.' in k or '.mlp.' in k}
 
-    # 2. Average weights across ranks
+    # Average weights across ranks
     if ddp:
         for v in block_state.values():
             dist.all_reduce(v, op=dist.ReduceOp.AVG)
 
-    # 3. Restore text-sized modules
+    # Restore text-sized modules
     restore_text_layers(model, saved)
 
-    # 4. Full reinit (operates on text-sized modules now)
+    # Full reinit (operates on text-sized modules now)
     model.init_weights()
 
-    # 5. Restore NCA-trained transformer weights (attention + MLP)
-    # init_weights() already set layernorm to correct defaults (weight=1, bias=0),
-    # and nanochat uses parameterless RMSNorm, so no layernorm state to transfer.
+    # Restore NCA-trained transformer weights (attention + MLP)
+    # nanochat uses parameterless RMSNorm, so no layernorm state to transfer.
     model.load_state_dict(block_state, strict=False)
 
 
-def run_nca_stage(model, nca_data_path, nca_steps, nca_lr, nca_batch_size,
-                  seq_len, alphabet_size, ddp, ddp_rank, ddp_world_size, device, wandb_run):
+def run_nca_stage(model, nca_data_path, nca_lr, nca_batch_size,
+                  seq_len, alphabet_size, ddp, ddp_rank, ddp_world_size, device, wandb_run,
+                  nca_steps=0):
     """Run the full NCA pre-pre-training stage.
 
-    Args:
-        model: GPT model (uncompiled, pre-FP8)
-        nca_data_path: Path to NCA dataset directory
-        nca_steps: Number of NCA training steps
-        nca_lr: Learning rate for NCA AdamW
-        nca_batch_size: Per-device batch size
-        seq_len: Sequence length (should match NCA data)
-        alphabet_size: NCA alphabet size (for computing vocab)
-        ddp: Whether distributed training is active
-        ddp_rank: Current rank
-        ddp_world_size: World size
-        device: Target device
-        wandb_run: Wandb run for logging
+    Loads pre-generated NCA data from disk. If nca_meta.json exists (epoch mode),
+    trains for multiple epochs with fresh data each epoch. Otherwise falls back to
+    step-based training on a flat dataset.
     """
     nca_vocab_size = alphabet_size ** 4
-    print0(f"NCA pre-pre-training: {nca_steps} steps, vocab={nca_vocab_size}, lr={nca_lr}")
 
-    # Load NCA dataset
+    # Load dataset
     data_path = os.path.join(nca_data_path, "nca_data.pt")
+    meta_path = os.path.join(nca_data_path, "nca_meta.json")
     nca_data = torch.load(data_path, weights_only=True).to(device)
-    # Truncate sequences to model's sequence length (NCA data may be longer)
     if nca_data.shape[1] > seq_len:
         nca_data = nca_data[:, :seq_len]
-    num_sequences = nca_data.shape[0]
-    # Clamp batch size to available sequences
-    nca_batch_size = min(nca_batch_size, num_sequences)
-    print0(f"Loaded NCA data: {num_sequences} sequences, shape {nca_data.shape}")
+
+    # Determine mode: epoch (has metadata) or legacy (flat dataset + nca_steps)
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+        num_rules = meta["num_rules"]
+        num_epochs = meta["num_epochs"]
+        assert nca_data.shape[0] == num_rules * num_epochs, \
+            f"Data shape {nca_data.shape[0]} != {num_rules}*{num_epochs}"
+        rank_rules = num_rules // max(ddp_world_size, 1)
+        steps_per_epoch = rank_rules // nca_batch_size
+        total_steps = steps_per_epoch * num_epochs
+        print0(f"NCA pre-pre-training (epoch mode): {num_epochs} epochs × {num_rules} rules "
+               f"= {total_steps} steps, vocab={nca_vocab_size}, lr={nca_lr}")
+    else:
+        # Legacy: flat dataset, train for nca_steps
+        num_rules = nca_data.shape[0]
+        num_epochs = 1
+        total_steps = nca_steps if nca_steps > 0 else num_rules // nca_batch_size
+        steps_per_epoch = total_steps
+        print0(f"NCA pre-pre-training (legacy): {total_steps} steps, vocab={nca_vocab_size}, lr={nca_lr}")
+
+    print0(f"Loaded NCA data: {nca_data.shape[0]} sequences, shape {nca_data.shape}")
 
     # Swap to NCA layers
     saved = swap_to_nca_layers(model, nca_vocab_size)
 
-    # Create NCA optimizer (plain AdamW over all parameters)
-    nca_optimizer = torch.optim.AdamW(model.parameters(), lr=nca_lr, betas=(0.9, 0.999))
-
-    # NCA training loop
-    warmup_steps = max(1, nca_steps // 10)
+    # Create NCA optimizer — paper uses Adam with no weight decay
+    nca_optimizer = torch.optim.AdamW(model.parameters(), lr=nca_lr, betas=(0.9, 0.999), weight_decay=0.0)
+    warmup_steps = max(1, total_steps // 10)
     model.train()
+    global_step = 0
 
-    for step in range(nca_steps):
-        # LR schedule: linear warmup, then constant
-        lr_mult = min(1.0, (step + 1) / warmup_steps)
-        for pg in nca_optimizer.param_groups:
-            pg['lr'] = nca_lr * lr_mult
+    for epoch in range(num_epochs):
+        # Slice this epoch's data
+        epoch_start = epoch * num_rules
+        epoch_end = epoch_start + num_rules
+        epoch_data = nca_data[epoch_start:epoch_end]
 
-        # Get batch: shard across ranks via offset + stride
-        batch_start = (step * nca_batch_size * ddp_world_size + ddp_rank * nca_batch_size) % num_sequences
-        indices = [(batch_start + i) % num_sequences for i in range(nca_batch_size)]
-        x = nca_data[indices]  # (B, seq_len)
-        # Next-token prediction: input is x[:, :-1], target is x[:, 1:]
-        # .contiguous() needed because slicing creates non-contiguous views
-        # and GPT.forward() uses .view() which requires contiguity
-        inputs = x[:, :-1].contiguous()
-        targets = x[:, 1:].contiguous()
+        # Shuffle within epoch — broadcast from rank 0 so all ranks agree
+        perm = torch.randperm(epoch_data.shape[0], device=device)
+        if ddp:
+            dist.broadcast(perm, src=0)
+        epoch_data = epoch_data[perm]
 
-        loss = model(inputs, targets)
-        loss.backward()
-        nca_optimizer.step()
-        nca_optimizer.zero_grad(set_to_none=True)
+        # Shard for DDP: each rank gets a non-overlapping slice
+        if ddp:
+            rank_size = epoch_data.shape[0] // ddp_world_size
+            epoch_data = epoch_data[ddp_rank * rank_size:(ddp_rank + 1) * rank_size]
 
-        if step % 10 == 0:
-            loss_val = loss.item()
-            print0(f"NCA step {step:04d}/{nca_steps} | loss: {loss_val:.4f} | lr: {nca_lr * lr_mult:.6f}")
-            wandb_run.log({"nca/loss": loss_val, "nca/step": step})
+        for i in range(0, epoch_data.shape[0] - nca_batch_size + 1, nca_batch_size):
+            if nca_steps > 0 and global_step >= nca_steps:
+                break  # legacy mode: stop at nca_steps
 
-    # Transfer: keep attention, reinit rest
-    print0("NCA transfer: preserving attention weights, reinitializing everything else")
+            # LR schedule: linear warmup, then constant
+            # LR schedule: 10% linear warmup + cosine decay (matches paper)
+            if global_step < warmup_steps:
+                lr_mult = (global_step + 1) / warmup_steps
+            else:
+                progress = (global_step - warmup_steps) / max(1, total_steps - warmup_steps)
+                lr_mult = 0.5 * (1.0 + math.cos(math.pi * progress))
+            for pg in nca_optimizer.param_groups:
+                pg['lr'] = nca_lr * lr_mult
+
+            x = epoch_data[i:i + nca_batch_size]
+            inputs = x[:, :-1].contiguous()
+            targets = x[:, 1:].contiguous()
+
+            loss = model(inputs, targets)
+            loss.backward()
+            nca_optimizer.step()
+            nca_optimizer.zero_grad(set_to_none=True)
+
+            if global_step % 50 == 0:
+                print0(f"NCA epoch {epoch+1:02d}/{num_epochs} step {global_step:05d}/{total_steps} "
+                       f"| loss: {loss.item():.4f} | lr: {nca_lr * lr_mult:.6f}")
+                wandb_run.log({"nca/loss": loss.item(), "nca/step": global_step, "nca/epoch": epoch})
+            global_step += 1
+
+        if nca_steps > 0 and global_step >= nca_steps:
+            break
+
+    print0(f"NCA training complete: {global_step} steps across {epoch+1} epochs")
+
+    # Transfer: keep attention + MLP, reinit embeddings/scalars
+    print0("NCA transfer: preserving attention + MLP weights, reinitializing embeddings/scalars")
     transfer_nca_to_text(model, saved, ddp=ddp)
 
     # Cleanup
@@ -191,5 +210,4 @@ def run_nca_stage(model, nca_data_path, nca_steps, nca_lr, nca_batch_size,
     gc.collect()
     if device.type == 'cuda':
         torch.cuda.empty_cache()
-
     print0("NCA pre-pre-training complete")

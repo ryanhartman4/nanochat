@@ -69,11 +69,11 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # NCA pre-pre-training
-parser.add_argument("--nca-steps", type=int, default=0, help="NCA pre-pre-training steps (0 = skip)")
 parser.add_argument("--nca-data", type=str, default="", help="path to NCA dataset directory (from nca_generate.py)")
-parser.add_argument("--nca-lr", type=float, default=3e-4, help="AdamW learning rate for NCA phase")
+parser.add_argument("--nca-lr", type=float, default=1e-4, help="AdamW learning rate for NCA phase (paper default: 1e-4)")
 parser.add_argument("--nca-batch-size", type=int, default=32, help="per-device batch size for NCA phase")
 parser.add_argument("--nca-alphabet-size", type=int, default=10, choices=[2, 4, 10], help="NCA alphabet size (default 10 matches paper; 2=16 tokens, 4=256 tokens, 10=10000 tokens)")
+parser.add_argument("--nca-steps", type=int, default=0, help="NCA training steps (legacy mode, 0 = use epoch mode from metadata)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -168,13 +168,14 @@ if resuming:
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
-# NCA Pre-Pre-Training (optional, skip if nca_steps=0 or resuming)
-if args.nca_steps > 0 and not resuming:
+# NCA Pre-Pre-Training (optional, skip if no nca_data or resuming)
+if args.nca_data and not resuming:
+    import time as _time
+    nca_t0 = _time.time()
     from scripts.base_train_nca import run_nca_stage
     run_nca_stage(
         model=model,
         nca_data_path=args.nca_data,
-        nca_steps=args.nca_steps,
         nca_lr=args.nca_lr,
         nca_batch_size=args.nca_batch_size,
         seq_len=args.max_seq_len,
@@ -184,7 +185,13 @@ if args.nca_steps > 0 and not resuming:
         ddp_world_size=ddp_world_size,
         device=device,
         wandb_run=wandb_run,
+        nca_steps=args.nca_steps,
     )
+    nca_wall_time = _time.time() - nca_t0
+    print0(f"NCA wall time: {nca_wall_time:.1f}s ({nca_wall_time/60:.1f}m)")
+    wandb_run.log({"nca/wall_time_sec": nca_wall_time})
+else:
+    nca_wall_time = 0
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -627,7 +634,9 @@ while True:
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
-print0(f"Total training time: {total_training_time/60:.2f}m")
+print0(f"NCA wall time: {nca_wall_time:.1f}s ({nca_wall_time/60:.1f}m)")
+print0(f"Main training time: {total_training_time/60:.2f}m")
+print0(f"Total wall time (NCA + training): {(nca_wall_time + total_training_time)/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
