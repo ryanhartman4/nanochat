@@ -67,9 +67,12 @@ OMP_NUM_THREADS=8 python -m scripts.nca_generate --num-tokens 164000000 --seq-le
     --alphabet-size 4 --device cuda --output $NANOCHAT_BASE_DIR/nca_data &
 NCA_GEN_PID=$!
 
-# train the tokenizer with reduced vocab size (24K) for better gradient flow (A.2.1)
-# Down from 32768 default — attacks gradient bottleneck: D/V improves from ~0.024 to ~0.032
-python -m scripts.tok_train --vocab-size 24576
+# train the tokenizer with default 32K vocab
+# NOTE: 24K was tested (2026-03-16 d24 run) but reverted. At D-24 scale, the marginal
+# gradient flow improvement (D/V: 0.047 → 0.063) did not compensate for reduced content
+# per sequence — each 2048-token window covers less text with fewer BPE merges, hurting
+# CORE tasks that need broad knowledge coverage. See results/2026-03-16-d24-8xh100-nca-24k.md
+python -m scripts.tok_train
 # evaluate the tokenizer (report compression ratio etc.)
 python -m scripts.tok_eval
 
@@ -80,7 +83,9 @@ wait $NCA_GEN_PID
 wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --nca-steps=500 --nca-data=$NANOCHAT_BASE_DIR/nca_data --nca-lr=3e-4 --nca-alphabet-size=4 --run=$WANDB_RUN
+# NOTE: --nca-batch-size=8 required at D-24 (default 32 OOMs at ~77.7GB/GPU)
+# NOTE: --device-batch-size=16 is the max that fits D-24 + FP8 (32 OOMs, needs 6GB more than available)
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --nca-steps=500 --nca-data=$NANOCHAT_BASE_DIR/nca_data --nca-lr=3e-4 --nca-alphabet-size=4 --nca-batch-size=8 --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
 
