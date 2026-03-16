@@ -422,7 +422,6 @@ if not resuming:
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
-    ce_step_count = 0 # count of normal CE steps (excludes proxy steps for EMA debias)
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
@@ -430,7 +429,6 @@ else:
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
-    ce_step_count = loop_state.get("ce_step_count", step)  # fallback for old checkpoints
     total_training_time = loop_state["total_training_time"]
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
@@ -531,7 +529,6 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
-                    "ce_step_count": ce_step_count,
                     "total_training_time": total_training_time,
                 },
             },
@@ -559,22 +556,18 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         if use_proxy:
-            # Head avoidance: compute proxy loss in decoder space (bypasses gradient bottleneck)
-            # Uses orig_model (uncompiled) to avoid DDP wrapper issues — orig_model shares
-            # the same Parameter objects, so grads land where the optimizer expects.
-            hidden = orig_model(x, return_hidden=True)  # (B, T, D) — no head, full-rank gradient
-            # Use lm_head weights as targets (NOT wte — model uses untied weights with different
-            # init scales). lm_head.weight[i] is the direction in D-space that the decoder
-            # associates with token i. This is the correct proxy target.
-            # Dequantize to compute dtype BEFORE indexing — when --fp8 is active, lm_head.weight
-            # is stored as FP8; indexing raw FP8 bytes and then casting gives inconsistent
-            # precision vs the actual Float8Linear forward path.
-            lm_head_w = orig_model.lm_head.weight.to(hidden.dtype)  # (V, D) — dequantized
-            target_emb = lm_head_w[y].detach()  # (B, T, D) — don't backprop into lm_head via this path
-            # Negative cosine similarity: "point hidden states toward correct decoder directions"
-            hidden_norm = F.normalize(hidden, dim=-1)
-            target_norm = F.normalize(target_emb, dim=-1)
-            loss = -(hidden_norm * target_norm).sum(dim=-1).mean()
+            # Additive head avoidance: CE trains everything normally, proxy adds full-rank
+            # gradient signal to the backbone that bypasses the head's rank-D bottleneck.
+            # Uses orig_model (uncompiled) so return_hidden works — orig_model shares the
+            # same Parameter objects, so grads land where the optimizer expects.
+            ce_loss, hidden = orig_model(x, y, return_hidden=True)
+            # Proxy target: lm_head.weight[correct_token] in D-space (NOT wte — untied weights).
+            # Detach targets so proxy gradient only flows through hidden states, not lm_head.
+            # Dequantize first when --fp8 is active (FP8 bytes → compute dtype before indexing).
+            lm_head_w = orig_model.lm_head.weight.to(hidden.dtype)
+            target_emb = lm_head_w[y].detach()
+            proxy_loss = -(F.normalize(hidden, dim=-1) * F.normalize(target_emb, dim=-1)).sum(dim=-1).mean()
+            loss = ce_loss + 0.1 * proxy_loss  # lambda=0.1: proxy is a gentle nudge, not a replacement
         else:
             loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -584,12 +577,6 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # After proxy steps: zero-fill None grads so the distributed optimizer's all-reduce doesn't crash.
-    # Proxy forward skips lm_head, value_embeds, etc., leaving their .grad as None.
-    if use_proxy:
-        for p in orig_model.parameters():
-            if p.grad is None and p.requires_grad:
-                p.grad = torch.zeros_like(p)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -620,11 +607,8 @@ while True:
 
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    if not use_proxy:
-        # Only update EMA on normal CE steps — proxy loss is on a different scale (cosine: [-1,0] vs CE: [0,~10])
-        ce_step_count += 1
-        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**max(ce_step_count, 1)) # debias using CE-only step count
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -641,7 +625,7 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    proxy_tag = " [PROXY]" if use_proxy else ""
+    proxy_tag = " [+PROXY]" if use_proxy else ""
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}{proxy_tag}")
     if step % 100 == 0:
         log_data = {

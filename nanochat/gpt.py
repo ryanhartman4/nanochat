@@ -459,9 +459,8 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
-        # Early return for proxy loss (head avoidance): return hidden states before the head
-        if return_hidden:
-            return x  # (B, T, D) — full-rank hidden states, no head compression
+        # Save hidden states for optional proxy loss (head avoidance)
+        hidden = x  # (B, T, D) — pre-head, still in computation graph
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
@@ -474,6 +473,8 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_hidden:
+                return loss, hidden  # additive head avoidance: CE + proxy in one forward pass
             return loss
         else:
             # inference: just return the logits directly
