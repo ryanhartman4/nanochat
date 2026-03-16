@@ -63,10 +63,10 @@ DATASET_DOWNLOAD_PID=$!
 # Kick off NCA generation in background (runs parallel with tokenizer training)
 # Use --device cuda while GPUs are idle during tokenizer training
 # Override OMP_NUM_THREADS for this command only (global =1 cripples CPU conv2d)
-# Epoch mode: 1000 rules × 100 epochs = 100K sequences with data regen each epoch.
-# Matches paper's approach (Han et al. 2026) — each epoch sees fresh trajectories from
-# the same rule pool, forcing the model to learn general rule inference, not memorize.
-OMP_NUM_THREADS=8 python -m scripts.nca_generate --num-rules 1000 --num-epochs 100 \
+# Epoch mode: 2000 rules × 100 epochs = 200K sequences with fresh trajectories each epoch.
+# More rules = more diverse dynamics for ICL rule inference. 2000 rules gives ~3,100 NCA
+# training steps (vs 1,500 at 1000 rules) in ~10 min — fits in the time budget.
+OMP_NUM_THREADS=8 python -m scripts.nca_generate --num-rules 2000 --num-epochs 100 \
     --seq-len 2048 --alphabet-size 10 --device cuda --output $NANOCHAT_BASE_DIR/nca_data &
 NCA_GEN_PID=$!
 

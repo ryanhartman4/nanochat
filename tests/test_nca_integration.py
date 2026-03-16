@@ -47,38 +47,41 @@ def test_nca_layer_swap_and_restore():
     assert model.lm_head.weight.shape == orig_head_shape
 
 
-def test_nca_transfer_preserves_attention():
-    """After transfer, attention weights should be NCA-trained, rest reinitialized."""
+def test_nca_transfer_preserves_transformer_blocks():
+    """After transfer, attention + MLP weights should be NCA-trained, embeddings reinitialized.
+
+    Paper (Han et al. 2026): keep all transformer weights (attention + MLP),
+    reinit only vocab-dependent layers (embeddings, value_embeds, scalars).
+    """
     model = _build_tiny_model()
 
-    # Snapshot original attention weights
-    orig_attn = {k: v.clone() for k, v in model.state_dict().items() if '.attn.' in k}
+    from scripts.base_train_nca import swap_to_nca_layers, transfer_nca_to_text
 
-    # Import transfer function
-    from scripts.base_train_nca import swap_to_nca_layers, restore_text_layers, transfer_nca_to_text
-
-    # Simulate NCA training: swap layers, modify attention weights
     nca_vocab_size = 16
     saved = swap_to_nca_layers(model, nca_vocab_size)
 
     # Manually perturb ALL weights to simulate NCA training
     with torch.no_grad():
         for name, param in model.named_parameters():
-            param.add_(1.0)  # shift all params by 1.0
+            param.add_(1.0)
 
-    # Snapshot NCA-trained attention AND MLP weights before transfer
+    # Snapshot NCA-trained attention and MLP weights before transfer
     nca_attn = {k: v.clone() for k, v in model.state_dict().items() if '.attn.' in k}
     nca_mlp = {k: v.clone() for k, v in model.state_dict().items() if '.mlp.' in k}
 
     # Transfer
     transfer_nca_to_text(model, saved, ddp=False)
 
-    # Attention should match NCA-trained values (preserved)
+    # Attention weights should be preserved
     for k in nca_attn:
         assert torch.allclose(model.state_dict()[k], nca_attn[k]), \
             f"Attention weight {k} was not preserved during transfer"
 
-    # MLP weights should NOT match NCA state (they were reinitialized by init_weights)
+    # MLP weights should also be preserved (paper keeps all transformer blocks)
     for k in nca_mlp:
-        assert not torch.equal(model.state_dict()[k], nca_mlp[k]), \
-            f"MLP weight {k} was not reinitialized after transfer"
+        assert torch.allclose(model.state_dict()[k], nca_mlp[k]), \
+            f"MLP weight {k} was not preserved during transfer"
+
+    # Embeddings should be reinitialized (different from NCA-trained values)
+    assert model.transformer.wte.weight.shape == saved['wte'].weight.shape, \
+        "Embedding shape not restored to text size"

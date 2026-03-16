@@ -83,7 +83,9 @@ def simulate_trajectory(rule, alphabet_size, grid_size=12, num_steps=56, tau=1e-
 def tokenize_trajectory(grids, alphabet_size):
     """Convert one-hot grids into flat token sequences using 2x2 patches.
 
-    Each patch of 4 cells maps bijectively to a token ID in [0, alphabet_size^4).
+    Each grid frame is wrapped with delimiter tokens:
+      [START, patch_0, ..., patch_35, END]  (38 tokens per grid for 12x12)
+    Patch IDs are in [0, alphabet_size^4), START = alphabet_size^4, END = alphabet_size^4 + 1.
     """
     batched = grids.dim() == 5
     if not batched:
@@ -100,7 +102,17 @@ def tokenize_trajectory(grids, alphabet_size):
     c3 = patches[:, :, :, 1, :, 1]
 
     token_ids = c0 * (alphabet_size**3) + c1 * (alphabet_size**2) + c2 * alphabet_size + c3
-    token_ids = token_ids.reshape(B, -1).long()
+    patches_per_grid = (H // 2) * (W // 2)
+    token_ids = token_ids.reshape(B, T, patches_per_grid).long()
+
+    # Wrap each grid frame with START/END delimiter tokens
+    START_TOKEN = alphabet_size ** 4
+    END_TOKEN = alphabet_size ** 4 + 1
+    start_col = torch.full((B, T, 1), START_TOKEN, dtype=token_ids.dtype, device=token_ids.device)
+    end_col = torch.full((B, T, 1), END_TOKEN, dtype=token_ids.dtype, device=token_ids.device)
+    token_ids = torch.cat([start_col, token_ids, end_col], dim=2)
+
+    token_ids = token_ids.reshape(B, -1)
 
     if not batched:
         return token_ids.squeeze(0)
@@ -123,9 +135,18 @@ def gzip_compression_ratio(tokens):
     return len(compressed) / len(raw_bytes)
 
 
-def passes_complexity_filter(tokens, min_ratio=0.50):
-    """Return True if the token sequence passes the complexity filter."""
-    return gzip_compression_ratio(tokens) > min_ratio
+def passes_complexity_filter(tokens, min_ratio=0.50, max_ratio=1.0):
+    """Return True if the token sequence falls within the target complexity band.
+
+    Gzip ratio is a tunable knob, not a fixed threshold. The paper (Han et al. 2026,
+    Section 5.2) shows optimal NCA complexity is domain-dependent:
+      - Code:      benefits from simpler dynamics (30-40% gzip band)
+      - Math/text: benefits from higher complexity  (50%+ gzip band)
+    The reference repo exposes both lower and upper bounds for this reason.
+    Tuning this band is a primary lever for domain-targeted NCA pre-pre-training.
+    """
+    r = gzip_compression_ratio(tokens)
+    return r > min_ratio and r <= max_ratio
 
 
 def _resolve_device(device_str):
@@ -138,22 +159,24 @@ def _resolve_device(device_str):
 def _compute_seq_params(seq_len, grid_size=12):
     """Compute NCA simulation parameters from sequence length."""
     patches_per_grid = (grid_size // 2) ** 2  # 36 for 12x12
-    grids_per_seq = seq_len // patches_per_grid
+    grid_len = patches_per_grid + 2  # +2 for START/END delimiters
+    grids_per_seq = seq_len // grid_len
     steps_per_seq = grids_per_seq - 1
-    return patches_per_grid, grids_per_seq, steps_per_seq
+    return patches_per_grid, grids_per_seq, steps_per_seq, grid_len
 
 
 def build_rule_pool(num_rules, alphabet_size, seq_len, min_gzip_ratio=0.50,
-                    grid_size=12, device="cpu"):
+                    max_gzip_ratio=1.0, grid_size=12, device="cpu"):
     """Create a pool of complexity-filtered NCA rules.
 
     Each rule is a small random neural network that defines unique dynamics.
-    Rules are filtered by generating a test trajectory and checking gzip complexity.
+    Rules are filtered by generating a test trajectory and checking gzip complexity
+    falls within [min_gzip_ratio, max_gzip_ratio].
 
     Returns:
         List of NCARule modules, steps_per_seq
     """
-    _, _, steps_per_seq = _compute_seq_params(seq_len, grid_size)
+    _, _, steps_per_seq, _ = _compute_seq_params(seq_len, grid_size)
 
     rules = []
     rejected = 0
@@ -163,19 +186,20 @@ def build_rule_pool(num_rules, alphabet_size, seq_len, min_gzip_ratio=0.50,
         grids = simulate_trajectory(rule, alphabet_size, grid_size=grid_size,
                                     num_steps=steps_per_seq, batch_size=1, device=device)
         tokens = tokenize_trajectory(grids, alphabet_size)[0][:seq_len]
-        if passes_complexity_filter(tokens, min_ratio=min_gzip_ratio):
+        if passes_complexity_filter(tokens, min_ratio=min_gzip_ratio, max_ratio=max_gzip_ratio):
             rules.append(rule)
         else:
             rejected += 1
         if (len(rules) + rejected) % 100 == 0:
             print(f"  Rule pool: {len(rules)}/{num_rules} accepted, {rejected} rejected")
 
-    print(f"Built rule pool: {num_rules} rules ({rejected} rejected by gzip filter)")
+    print(f"Built rule pool: {num_rules} rules ({rejected} rejected by gzip filter, "
+          f"band=[{min_gzip_ratio:.2f}, {max_gzip_ratio:.2f}])")
     return rules, steps_per_seq
 
 
 def generate_epoch_dataset(num_rules, num_epochs, seq_len, alphabet_size, output_dir,
-                           min_gzip_ratio=0.50, grid_size=12, device="auto"):
+                           min_gzip_ratio=0.50, max_gzip_ratio=1.0, grid_size=12, device="auto"):
     """Generate a structured NCA dataset: num_epochs fresh trajectories per rule.
 
     Creates a fixed pool of rules, then generates num_epochs different trajectories
@@ -194,7 +218,7 @@ def generate_epoch_dataset(num_rules, num_epochs, seq_len, alphabet_size, output
 
     # Build complexity-filtered rule pool
     rules, steps_per_seq = build_rule_pool(
-        num_rules, alphabet_size, seq_len, min_gzip_ratio, grid_size, device)
+        num_rules, alphabet_size, seq_len, min_gzip_ratio, max_gzip_ratio, grid_size, device)
 
     all_sequences = []
     epoch_rejects = 0
@@ -207,7 +231,7 @@ def generate_epoch_dataset(num_rules, num_epochs, seq_len, alphabet_size, output
                 grids = simulate_trajectory(rule, alphabet_size, grid_size=grid_size,
                                             num_steps=steps_per_seq, batch_size=1, device=device)
                 tokens = tokenize_trajectory(grids, alphabet_size)[0][:seq_len]
-                if passes_complexity_filter(tokens, min_ratio=min_gzip_ratio):
+                if passes_complexity_filter(tokens, min_ratio=min_gzip_ratio, max_ratio=max_gzip_ratio):
                     break
                 epoch_rejects += 1
             # Pad if needed
@@ -223,8 +247,9 @@ def generate_epoch_dataset(num_rules, num_epochs, seq_len, alphabet_size, output
 
     os.makedirs(output_dir, exist_ok=True)
     torch.save(dataset, os.path.join(output_dir, "nca_data.pt"))
+    _, _, _, grid_len = _compute_seq_params(seq_len, grid_size)
     meta = {"num_rules": num_rules, "num_epochs": num_epochs,
-            "seq_len": seq_len, "alphabet_size": alphabet_size}
+            "seq_len": seq_len, "alphabet_size": alphabet_size, "grid_len": grid_len}
     with open(os.path.join(output_dir, "nca_meta.json"), "w") as f:
         json.dump(meta, f)
 
@@ -235,14 +260,12 @@ def generate_epoch_dataset(num_rules, num_epochs, seq_len, alphabet_size, output
 
 
 def generate_dataset(num_tokens, seq_len, alphabet_size, output_dir, min_gzip_ratio=0.50,
-                     grid_size=12, trajectories_per_rule=128, device="auto"):
+                     max_gzip_ratio=1.0, grid_size=12, trajectories_per_rule=128, device="auto"):
     """Legacy: Generate NCA dataset by token count (old interface)."""
     device = _resolve_device(device) if isinstance(device, str) else device
     print(f"NCA generation on device: {device}")
 
-    patches_per_grid = (grid_size // 2) ** 2
-    grids_per_seq = seq_len // patches_per_grid
-    steps_per_seq = grids_per_seq - 1
+    patches_per_grid, grids_per_seq, steps_per_seq, _ = _compute_seq_params(seq_len, grid_size)
     num_sequences = (num_tokens + seq_len - 1) // seq_len
 
     all_sequences = []
@@ -270,7 +293,7 @@ def generate_dataset(num_tokens, seq_len, alphabet_size, output_dir, min_gzip_ra
             if generated >= num_sequences:
                 break
             seq = tokens_cpu[i]
-            if passes_complexity_filter(seq, min_ratio=min_gzip_ratio):
+            if passes_complexity_filter(seq, min_ratio=min_gzip_ratio, max_ratio=max_gzip_ratio):
                 all_sequences.append(seq)
                 generated += 1
             else:
@@ -290,7 +313,7 @@ def generate_dataset(num_tokens, seq_len, alphabet_size, output_dir, min_gzip_ra
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate NCA pre-pre-training dataset")
     # Epoch mode (recommended)
-    parser.add_argument("--num-rules", type=int, default=0, help="Number of unique NCA rules (epoch mode)")
+    parser.add_argument("--num-rules", type=int, default=16000, help="Number of unique NCA rules (epoch mode, default 16000)")
     parser.add_argument("--num-epochs", type=int, default=100, help="Trajectories per rule = training epochs")
     # Legacy token-count mode
     parser.add_argument("--num-tokens", type=int, default=0, help="Target tokens (legacy mode, use --num-rules instead)")
@@ -298,15 +321,31 @@ if __name__ == "__main__":
     parser.add_argument("--seq-len", type=int, default=2048, help="Sequence length per sample")
     parser.add_argument("--alphabet-size", type=int, default=10, choices=[2, 4, 10], help="NCA alphabet size")
     parser.add_argument("--output", type=str, required=True, help="Output directory")
-    parser.add_argument("--min-gzip-ratio", type=float, default=0.50, help="Minimum gzip compression ratio")
+    parser.add_argument("--min-gzip-ratio", type=float, default=0.50,
+                        help="Minimum gzip compression ratio (lower bound of complexity band)")
+    parser.add_argument("--max-gzip-ratio", type=float, default=1.0,
+                        help="Maximum gzip compression ratio (upper bound; 1.0 = no upper limit). "
+                             "Paper shows optimal band is domain-dependent: 0.30-0.40 for code, 0.50+ for math/text")
     parser.add_argument("--trajectories-per-rule", type=int, default=128,
                         help="Trajectories per rule (legacy mode only)")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
                         help="Device for simulation")
     args = parser.parse_args()
 
-    if args.num_rules > 0:
-        # Epoch mode
+    if args.num_tokens > 0:
+        # Legacy mode (explicit --num-tokens overrides default --num-rules)
+        generate_dataset(
+            num_tokens=args.num_tokens,
+            seq_len=args.seq_len,
+            alphabet_size=args.alphabet_size,
+            output_dir=args.output,
+            min_gzip_ratio=args.min_gzip_ratio,
+            max_gzip_ratio=args.max_gzip_ratio,
+            trajectories_per_rule=args.trajectories_per_rule,
+            device=args.device,
+        )
+    elif args.num_rules > 0:
+        # Epoch mode (default: 16000 rules)
         generate_epoch_dataset(
             num_rules=args.num_rules,
             num_epochs=args.num_epochs,
@@ -314,17 +353,7 @@ if __name__ == "__main__":
             alphabet_size=args.alphabet_size,
             output_dir=args.output,
             min_gzip_ratio=args.min_gzip_ratio,
-            device=args.device,
-        )
-    elif args.num_tokens > 0:
-        # Legacy mode
-        generate_dataset(
-            num_tokens=args.num_tokens,
-            seq_len=args.seq_len,
-            alphabet_size=args.alphabet_size,
-            output_dir=args.output,
-            min_gzip_ratio=args.min_gzip_ratio,
-            trajectories_per_rule=args.trajectories_per_rule,
+            max_gzip_ratio=args.max_gzip_ratio,
             device=args.device,
         )
     else:

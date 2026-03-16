@@ -109,7 +109,7 @@ def run_nca_stage(model, nca_data_path, nca_lr, nca_batch_size,
     trains for multiple epochs with fresh data each epoch. Otherwise falls back to
     step-based training on a flat dataset.
     """
-    nca_vocab_size = alphabet_size ** 4
+    nca_vocab_size = alphabet_size ** 4 + 2  # +2 for START/END delimiter tokens
 
     # Load dataset
     data_path = os.path.join(nca_data_path, "nca_data.pt")
@@ -124,6 +124,7 @@ def run_nca_stage(model, nca_data_path, nca_lr, nca_batch_size,
             meta = json.load(f)
         num_rules = meta["num_rules"]
         num_epochs = meta["num_epochs"]
+        grid_len = meta.get("grid_len", 38)  # 36 patches + 2 delimiters; default for backward compat
         assert nca_data.shape[0] == num_rules * num_epochs, \
             f"Data shape {nca_data.shape[0]} != {num_rules}*{num_epochs}"
         rank_rules = num_rules // max(ddp_world_size, 1)
@@ -135,6 +136,7 @@ def run_nca_stage(model, nca_data_path, nca_lr, nca_batch_size,
         # Legacy: flat dataset, train for nca_steps
         num_rules = nca_data.shape[0]
         num_epochs = 1
+        grid_len = 38  # default: (12//2)^2 + 2 for 12x12 grid with delimiters
         total_steps = nca_steps if nca_steps > 0 else num_rules // nca_batch_size
         steps_per_epoch = total_steps
         print0(f"NCA pre-pre-training (legacy): {total_steps} steps, vocab={nca_vocab_size}, lr={nca_lr}")
@@ -184,6 +186,7 @@ def run_nca_stage(model, nca_data_path, nca_lr, nca_batch_size,
             x = epoch_data[i:i + nca_batch_size]
             inputs = x[:, :-1].contiguous()
             targets = x[:, 1:].contiguous()
+            targets[:, :grid_len] = -1  # mask first grid frame (ICL context, not training signal)
 
             loss = model(inputs, targets)
             loss.backward()

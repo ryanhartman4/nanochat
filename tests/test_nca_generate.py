@@ -55,18 +55,18 @@ def test_simulate_trajectory_stochastic():
 
 
 def test_tokenize_single_shape():
-    """Single trajectory tokenization produces 1D output."""
+    """Single trajectory tokenization produces 1D output with delimiters."""
     alphabet_size = 2
     num_grids = 56
     grids = torch.zeros(num_grids, alphabet_size, 12, 12)
     grids[:, 0, :, :] = 1.0
     tokens = tokenize_trajectory(grids, alphabet_size)
     assert tokens.dim() == 1
-    assert tokens.shape[0] == 56 * 36  # 56 grids * 36 patches each = 2016
+    assert tokens.shape[0] == 56 * 38  # 56 grids * (36 patches + 2 delimiters) = 2128
 
 
 def test_tokenize_batched_shape():
-    """Batched tokenization produces (B, tokens) output."""
+    """Batched tokenization produces (B, tokens) output with delimiters."""
     alphabet_size = 2
     B = 4
     num_grids = 56
@@ -74,13 +74,13 @@ def test_tokenize_batched_shape():
     grids[:, :, 0, :, :] = 1.0
     tokens = tokenize_trajectory(grids, alphabet_size)
     assert tokens.dim() == 2
-    assert tokens.shape == (B, 56 * 36)
+    assert tokens.shape == (B, 56 * 38)
 
 
 def test_tokenize_grid_vocab_range():
-    """Token IDs should be in [0, alphabet^4)."""
+    """Token IDs should be in [0, alphabet^4 + 2) including START/END delimiters."""
     alphabet_size = 2
-    nca_vocab_size = alphabet_size ** 4  # 16
+    nca_vocab_size = alphabet_size ** 4 + 2  # 16 patches + START + END = 18
     grids = torch.zeros(56, alphabet_size, 12, 12)
     grids[:, 0, :, :] = 1.0
     tokens = tokenize_trajectory(grids, alphabet_size)
@@ -97,7 +97,9 @@ def test_tokenize_bijective():
     g2[0, 0, 0, 0] = 0.0; g2[0, 1, 0, 0] = 1.0
     t1 = tokenize_trajectory(g1, alphabet_size)
     t2 = tokenize_trajectory(g2, alphabet_size)
-    assert t1[0] != t2[0], "Different patches mapped to same token — not bijective"
+    # t1[0] and t2[0] are both START delimiter; compare first patch token at index 1
+    assert t1[0] == alphabet_size ** 4, "First token should be START delimiter"
+    assert t1[1] != t2[1], "Different patches mapped to same token — not bijective"
 
 
 def test_gzip_filter_rejects_trivial():
@@ -137,7 +139,7 @@ def test_generate_dataset_produces_valid_file():
         data = torch.load(output_path, weights_only=True)
         assert data.dim() == 2, f"Expected 2D tensor, got {data.dim()}D"
         assert data.shape[1] == 2048, f"Expected seq_len=2048, got {data.shape[1]}"
-        nca_vocab = 2 ** 4
+        nca_vocab = 2 ** 4 + 2  # +2 for START/END delimiters
         assert data.min() >= 0 and data.max() < nca_vocab, \
             f"Token range [{data.min()}, {data.max()}] outside [0, {nca_vocab})"
         assert data.shape[0] >= 1, f"Expected at least 1 sequence, got {data.shape[0]}"
