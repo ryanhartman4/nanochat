@@ -457,6 +457,15 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
+        # Append BPB to a simple CSV file for easy monitoring from another terminal
+        # e.g.: tail -f ~/.cache/nanochat/bpb_log.csv
+        if ddp_rank == 0:
+            bpb_log_path = os.path.join(os.environ.get("NANOCHAT_BASE_DIR", os.path.expanduser("~/.cache/nanochat")), "bpb_log.csv")
+            write_header = not os.path.exists(bpb_log_path)
+            with open(bpb_log_path, "a") as f:
+                if write_header:
+                    f.write("step,bpb,min_bpb,wall_time_min\n")
+                f.write(f"{step},{val_bpb:.6f},{min_val_bpb:.6f},{total_training_time/60:.2f}\n")
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
