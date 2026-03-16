@@ -82,18 +82,24 @@ def restore_text_layers(model, saved):
 def transfer_nca_to_text(model, saved, ddp=False):
     """Execute NCA -> text transfer protocol.
 
-    1. Deep copy attention weights
-    2. All-reduce across ranks (if DDP)
-    3. Restore text-sized modules
-    4. Full reinit
-    5. Load NCA-trained attention weights
-    """
-    # 1. Deep copy attention weights
-    attn_state = {k: v.clone() for k, v in model.state_dict().items() if '.attn.' in k}
+    Following Han et al. 2026: keep all transformer weights (attention + MLP + layernorm),
+    reinit only the vocab-dependent layers (embeddings, value_embeds, scalars).
 
-    # 2. Average attention weights across ranks
+    1. Deep copy all transformer block weights (attention + MLP)
+    2. All-reduce across ranks (if DDP)
+    3. Restore text-sized modules (embeddings, value_embeds)
+    4. Full reinit (resets everything to text-sized defaults)
+    5. Load NCA-trained transformer weights back (attention + MLP + layernorm)
+    """
+    # 1. Deep copy all transformer block weights — attention AND MLP AND layernorm
+    # Paper ablation (Fig 5): attention is the primary transfer mechanism, but keeping
+    # MLP/layernorm is the paper's default config that produced headline results.
+    block_state = {k: v.clone() for k, v in model.state_dict().items()
+                   if '.attn.' in k or '.mlp.' in k}
+
+    # 2. Average weights across ranks
     if ddp:
-        for v in attn_state.values():
+        for v in block_state.values():
             dist.all_reduce(v, op=dist.ReduceOp.AVG)
 
     # 3. Restore text-sized modules
@@ -102,8 +108,10 @@ def transfer_nca_to_text(model, saved, ddp=False):
     # 4. Full reinit (operates on text-sized modules now)
     model.init_weights()
 
-    # 5. Restore NCA-trained attention weights
-    model.load_state_dict(attn_state, strict=False)
+    # 5. Restore NCA-trained transformer weights (attention + MLP)
+    # init_weights() already set layernorm to correct defaults (weight=1, bias=0),
+    # and nanochat uses parameterless RMSNorm, so no layernorm state to transfer.
+    model.load_state_dict(block_state, strict=False)
 
 
 def run_nca_stage(model, nca_data_path, nca_steps, nca_lr, nca_batch_size,
