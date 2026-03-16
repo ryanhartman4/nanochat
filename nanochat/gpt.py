@@ -184,6 +184,7 @@ class GPT(nn.Module):
         self.smear_lambda = nn.Parameter(torch.zeros(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
         self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
+        self.aux_lambda = 0.0  # deep supervision weight; set before compile
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -459,11 +460,25 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
+        # Deep supervision: aux CE from mid-layer hidden states through shared lm_head
+        # NOTE: aux_logits (B,T,V) is held by autograd and coexists with main logits in memory.
+        # If this OOMs, wrap this block in torch.utils.checkpoint.checkpoint to recompute during backward.
+        softcap = 15
+        aux_loss = None
+        if self.aux_lambda > 0 and targets is not None and self.training:
+            aux_h = norm(x_backout)  # raw mid-layer states, no backout subtraction
+            aux_logits = self.lm_head(aux_h)
+            aux_logits = aux_logits[..., :self.config.vocab_size]
+            aux_logits = aux_logits.float()
+            aux_logits = softcap * torch.tanh(aux_logits / softcap)
+            aux_loss = F.cross_entropy(aux_logits.view(-1, aux_logits.size(-1)),
+                                       targets.view(-1), ignore_index=-1,
+                                       reduction=loss_reduction)
+
         # Save hidden states for optional proxy loss (head avoidance)
         hidden = x  # (B, T, D) — pre-head, still in computation graph
 
         # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
@@ -473,6 +488,8 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if aux_loss is not None:
+                loss = loss + self.aux_lambda * aux_loss
             if return_hidden:
                 return loss, hidden  # additive head avoidance: CE + proxy in one forward pass
             return loss
