@@ -73,7 +73,7 @@ parser.add_argument("--nca-steps", type=int, default=0, help="NCA pre-pre-traini
 parser.add_argument("--nca-data", type=str, default="", help="path to NCA dataset directory (from nca_generate.py)")
 parser.add_argument("--nca-lr", type=float, default=3e-4, help="AdamW learning rate for NCA phase")
 parser.add_argument("--nca-batch-size", type=int, default=32, help="per-device batch size for NCA phase")
-parser.add_argument("--nca-alphabet-size", type=int, default=2, choices=[2, 4], help="NCA alphabet size (2=16 tokens, 4=256 tokens)")
+parser.add_argument("--nca-alphabet-size", type=int, default=10, choices=[2, 4, 10], help="NCA alphabet size (default 10 matches paper; 2=16 tokens, 4=256 tokens, 10=10000 tokens)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")

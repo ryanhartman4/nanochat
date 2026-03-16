@@ -63,8 +63,10 @@ DATASET_DOWNLOAD_PID=$!
 # Kick off NCA generation in background (runs parallel with tokenizer training)
 # Use --device cuda while GPUs are idle during tokenizer training
 # Override OMP_NUM_THREADS for this command only (global =1 cripples CPU conv2d)
+# Alphabet size 10 matches the paper's default (Han et al. 2026). We initially tested n=2 and n=4
+# but n=10 is what produced the paper's headline results (1.6x speedup, 6% improvement).
 OMP_NUM_THREADS=8 python -m scripts.nca_generate --num-tokens 164000000 --seq-len 2048 \
-    --alphabet-size 4 --device cuda --output $NANOCHAT_BASE_DIR/nca_data &
+    --alphabet-size 10 --device cuda --output $NANOCHAT_BASE_DIR/nca_data &
 NCA_GEN_PID=$!
 
 # train the tokenizer with default 32K vocab
@@ -85,7 +87,7 @@ wait $DATASET_DOWNLOAD_PID
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
 # NOTE: --nca-batch-size=8 required at D-24 (default 32 OOMs at ~77.7GB/GPU)
 # NOTE: --device-batch-size=16 is the max that fits D-24 + FP8 (32 OOMs, needs 6GB more than available)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --nca-steps=500 --nca-data=$NANOCHAT_BASE_DIR/nca_data --nca-lr=3e-4 --nca-alphabet-size=4 --nca-batch-size=8 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --nca-steps=500 --nca-data=$NANOCHAT_BASE_DIR/nca_data --nca-lr=1e-4 --nca-alphabet-size=10 --nca-batch-size=8 --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
 
