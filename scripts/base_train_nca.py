@@ -79,16 +79,26 @@ def transfer_nca_to_text(model, saved, ddp=False, transfer_mode="full"):
 
     transfer_mode='full' (paper default): keep attention + MLP weights, reinit embeddings/scalars.
     transfer_mode='attn-only': keep only attention weights, reinit MLPs + embeddings/scalars.
+
+    Both modes also preserve nanochat's learnable scalars (resid_lambdas, x0_lambdas,
+    smear_gate, smear_lambda, backout_lambda). These are not vocab-dependent — they
+    control residual stream scaling and were co-adapted with attention during NCA training.
+    Reiniting them creates a mismatch: attention weights expect the NCA-trained scalar
+    values, but get the default init values instead, causing a BPB penalty at transfer.
     """
+    # Nanochat scalars that are co-adapted with attention weights during NCA training.
+    # These are NOT vocab-dependent and should be preserved across transfer.
+    SCALAR_KEYS = {'resid_lambdas', 'x0_lambdas', 'smear_gate.weight', 'smear_lambda', 'backout_lambda'}
+
     # Deep copy transformer block weights based on transfer mode
     if transfer_mode == "attn-only":
         block_state = {k: v.clone() for k, v in model.state_dict().items()
-                       if '.attn.' in k}
-        print0(f"NCA transfer (attn-only): preserving {len(block_state)} attention weight tensors, reinitializing MLPs")
+                       if '.attn.' in k or k in SCALAR_KEYS}
+        print0(f"NCA transfer (attn-only): preserving {len(block_state)} tensors (attention + scalars), reinitializing MLPs")
     else:
         block_state = {k: v.clone() for k, v in model.state_dict().items()
-                       if '.attn.' in k or '.mlp.' in k}
-        print0(f"NCA transfer (full): preserving {len(block_state)} attention + MLP weight tensors")
+                       if '.attn.' in k or '.mlp.' in k or k in SCALAR_KEYS}
+        print0(f"NCA transfer (full): preserving {len(block_state)} tensors (attention + MLP + scalars)")
 
     # Average weights across ranks
     if ddp:
@@ -101,7 +111,7 @@ def transfer_nca_to_text(model, saved, ddp=False, transfer_mode="full"):
     # Full reinit (operates on text-sized modules now)
     model.init_weights()
 
-    # Restore NCA-trained transformer weights (attention + MLP)
+    # Restore NCA-trained weights (block weights + scalars)
     # nanochat uses parameterless RMSNorm, so no layernorm state to transfer.
     model.load_state_dict(block_state, strict=False)
 

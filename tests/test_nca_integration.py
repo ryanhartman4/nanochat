@@ -65,9 +65,11 @@ def test_nca_transfer_preserves_transformer_blocks():
         for name, param in model.named_parameters():
             param.add_(1.0)
 
-    # Snapshot NCA-trained attention and MLP weights before transfer
+    # Snapshot NCA-trained weights before transfer
     nca_attn = {k: v.clone() for k, v in model.state_dict().items() if '.attn.' in k}
     nca_mlp = {k: v.clone() for k, v in model.state_dict().items() if '.mlp.' in k}
+    SCALAR_KEYS = {'resid_lambdas', 'x0_lambdas', 'smear_gate.weight', 'smear_lambda', 'backout_lambda'}
+    nca_scalars = {k: v.clone() for k, v in model.state_dict().items() if k in SCALAR_KEYS}
 
     # Transfer
     transfer_nca_to_text(model, saved, ddp=False)
@@ -81,6 +83,11 @@ def test_nca_transfer_preserves_transformer_blocks():
     for k in nca_mlp:
         assert torch.allclose(model.state_dict()[k], nca_mlp[k]), \
             f"MLP weight {k} was not preserved during transfer"
+
+    # Scalars should be preserved (co-adapted with attention during NCA training)
+    for k in nca_scalars:
+        assert torch.allclose(model.state_dict()[k], nca_scalars[k]), \
+            f"Scalar {k} was not preserved during transfer"
 
     # Embeddings should be reinitialized (different from NCA-trained values)
     assert model.transformer.wte.weight.shape == saved['wte'].weight.shape, \
