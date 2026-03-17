@@ -141,8 +141,15 @@ def run_nca_stage(model, nca_data_path, nca_lr, nca_batch_size,
         num_rules = meta["num_rules"]
         num_epochs = meta["num_epochs"]
         grid_len = meta.get("grid_len", 38)  # 36 patches + 2 delimiters; default for backward compat
-        assert nca_data.shape[0] == num_rules * num_epochs, \
-            f"Data shape {nca_data.shape[0]} != {num_rules}*{num_epochs}"
+        expected = num_rules * num_epochs
+        actual = nca_data.shape[0]
+        if actual < expected:
+            # Batch gzip filtering may drop some trajectories — use actual count
+            num_epochs = actual // num_rules  # full epochs we can use
+            remainder = actual - num_epochs * num_rules
+            if remainder > 0:
+                nca_data = nca_data[:num_epochs * num_rules]  # trim partial epoch
+            print0(f"NCA data filtered: {actual}/{expected} sequences kept, using {num_epochs} full epochs")
         rank_rules = num_rules // max(ddp_world_size, 1)
         steps_per_epoch = rank_rules // nca_batch_size
         total_steps = steps_per_epoch * num_epochs

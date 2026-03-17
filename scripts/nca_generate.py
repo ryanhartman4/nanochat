@@ -221,29 +221,30 @@ def generate_epoch_dataset(num_rules, num_epochs, seq_len, alphabet_size, output
         num_rules, alphabet_size, seq_len, min_gzip_ratio, max_gzip_ratio, grid_size, device)
 
     all_sequences = []
-    epoch_rejects = 0
-    for epoch in range(num_epochs):
-        epoch_seqs = []
-        for rule in rules:
-            # Fresh trajectory: new random initial state each time
-            # Retry if this trajectory fails gzip filter (rule passed but init state may be degenerate)
-            for _attempt in range(5):
-                grids = simulate_trajectory(rule, alphabet_size, grid_size=grid_size,
-                                            num_steps=steps_per_seq, batch_size=1, device=device)
-                tokens = tokenize_trajectory(grids, alphabet_size)[0][:seq_len]
-                if passes_complexity_filter(tokens, min_ratio=min_gzip_ratio, max_ratio=max_gzip_ratio):
-                    break
-                epoch_rejects += 1
-            # Pad if needed
-            if tokens.shape[0] < seq_len:
-                tokens = F.pad(tokens, (0, seq_len - tokens.shape[0]), value=0)
-            epoch_seqs.append(tokens.cpu())
-        all_sequences.extend(epoch_seqs)
+    total_generated = 0
+    total_rejected = 0
+    for rule_idx, rule in enumerate(rules):
+        # Batch all epochs for this rule in one GPU call
+        grids = simulate_trajectory(rule, alphabet_size, grid_size=grid_size,
+                                    num_steps=steps_per_seq, batch_size=num_epochs, device=device)
+        tokens = tokenize_trajectory(grids, alphabet_size)[:, :seq_len]  # (num_epochs, seq_len)
+        # Pad if needed
+        if tokens.shape[1] < seq_len:
+            tokens = F.pad(tokens, (0, seq_len - tokens.shape[1]), value=0)
+        # Batch gzip filter
+        kept = []
+        for i in range(tokens.shape[0]):
+            if passes_complexity_filter(tokens[i], min_ratio=min_gzip_ratio, max_ratio=max_gzip_ratio):
+                kept.append(tokens[i].cpu())
+            else:
+                total_rejected += 1
+        all_sequences.extend(kept)
+        total_generated += len(kept)
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1}/{num_epochs} generated ({len(all_sequences)} total sequences)")
+        if (rule_idx + 1) % 200 == 0 or rule_idx == 0:
+            print(f"Rule {rule_idx+1}/{num_rules}: {total_generated} kept, {total_rejected} rejected")
 
-    dataset = torch.stack(all_sequences)  # (num_epochs * num_rules, seq_len)
+    dataset = torch.stack(all_sequences)
 
     os.makedirs(output_dir, exist_ok=True)
     torch.save(dataset, os.path.join(output_dir, "nca_data.pt"))
@@ -255,7 +256,7 @@ def generate_epoch_dataset(num_rules, num_epochs, seq_len, alphabet_size, output
 
     total_tokens = dataset.shape[0] * dataset.shape[1]
     print(f"Generated {dataset.shape[0]} sequences ({total_tokens/1e6:.0f}M tokens), "
-          f"saved to {output_dir} ({epoch_rejects} per-epoch gzip retries)")
+          f"saved to {output_dir} ({total_rejected} rejected by gzip filter)")
     print(f"Data size: {dataset.element_size() * dataset.nelement() / 1e6:.0f}MB")
 
 

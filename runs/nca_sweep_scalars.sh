@@ -4,12 +4,11 @@
 #
 # Gzip band capped at 0.80 to filter out near-random chaotic sequences.
 #
-# 5 sequential d12 experiments:
+# 4 sequential d12 experiments:
 #   0. Baseline (no NCA)                              ~15 min
 #   1. 2000 rules × 50ep  (3,100 NCA steps)           ~25 min  (gen ~3 min)
 #   2. 4000 rules × 50ep  (6,250 NCA steps)           ~40 min  (gen ~8 min)
 #   3. 6000 rules × 50ep  (9,375 NCA steps)           ~55 min  (gen ~15 min)
-#   4. 8000 rules × 50ep  (12,500 NCA steps)          ~75 min  (gen ~25 min, train ~40 min)
 #
 # All use attn-only transfer + scalar preservation.
 # Single GPU, nca_batch_size=32 (effective batch 32, close to paper's 16).
@@ -18,7 +17,7 @@
 #   Baseline: 0.8538, best NCA: 0.8545 (+0.0007, 4K attn-only)
 #
 # Usage: bash runs/nca_sweep_scalars.sh
-# Total: ~3.5 hours
+# Total: ~2.5 hours
 # Results: $NANOCHAT_BASE_DIR/sweep_scalars/bpb_*.csv
 
 set -e
@@ -43,7 +42,7 @@ fi
 # 50 epochs across all configs (prior sweep showed more epochs hurts).
 # Gzip band [0.50, 0.80] — cap at 0.80 to reject near-random chaotic sequences.
 
-RULE_COUNTS=(2000 4000 6000 8000)
+RULE_COUNTS=(2000 4000 6000)
 
 for RULES in "${RULE_COUNTS[@]}"; do
     DATA_DIR="$NANOCHAT_BASE_DIR/sweep_scalars_nca-${RULES}-50ep"
@@ -63,16 +62,20 @@ done
 COMMON_ARGS="--depth=12 --eval-every=100 --core-metric-every=10000 --sample-every=-1 --save-every=-1 --run=dummy"
 
 # --- Run 0: Baseline ---
-echo ""
-echo "=========================================="
-echo "=== [0/4] Baseline (no NCA) ==="
-echo "=========================================="
-rm -f "$NANOCHAT_BASE_DIR/bpb_log.csv"
+if [ -f "$SWEEP_DIR/bpb_baseline.csv" ]; then
+    echo "=== Baseline already exists, skipping ==="
+else
+    echo ""
+    echo "=========================================="
+    echo "=== [0/3] Baseline (no NCA) ==="
+    echo "=========================================="
+    rm -f "$NANOCHAT_BASE_DIR/bpb_log.csv"
 
-python -m scripts.base_train $COMMON_ARGS
+    python -m scripts.base_train $COMMON_ARGS
 
-cp "$NANOCHAT_BASE_DIR/bpb_log.csv" "$SWEEP_DIR/bpb_baseline.csv"
-echo "=== Saved: bpb_baseline.csv ==="
+    cp "$NANOCHAT_BASE_DIR/bpb_log.csv" "$SWEEP_DIR/bpb_baseline.csv"
+    echo "=== Saved: bpb_baseline.csv ==="
+fi
 
 # --- NCA Runs ---
 RUN_NUM=1
@@ -118,4 +121,4 @@ done
 echo ""
 echo "Key question: does any config BEAT baseline (min_BPB < 0.8538)?"
 echo "If yes: scalar fix + gzip cap resolved the convergence penalty."
-echo "If no at 8K: NCA may not transfer to nanochat at d12 scale — try d24."
+echo "If no at 6K: NCA may not transfer to nanochat at d12 scale — try d24."
