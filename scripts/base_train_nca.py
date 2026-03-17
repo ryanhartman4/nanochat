@@ -74,15 +74,21 @@ def restore_text_layers(model, saved):
     model.config.vocab_size = saved['vocab_size']
 
 
-def transfer_nca_to_text(model, saved, ddp=False):
+def transfer_nca_to_text(model, saved, ddp=False, transfer_mode="full"):
     """Execute NCA -> text transfer protocol.
 
-    Following Han et al. 2026: keep all transformer weights (attention + MLP),
-    reinit only the vocab-dependent layers (embeddings, value_embeds, scalars).
+    transfer_mode='full' (paper default): keep attention + MLP weights, reinit embeddings/scalars.
+    transfer_mode='attn-only': keep only attention weights, reinit MLPs + embeddings/scalars.
     """
-    # Deep copy all transformer block weights — attention AND MLP
-    block_state = {k: v.clone() for k, v in model.state_dict().items()
-                   if '.attn.' in k or '.mlp.' in k}
+    # Deep copy transformer block weights based on transfer mode
+    if transfer_mode == "attn-only":
+        block_state = {k: v.clone() for k, v in model.state_dict().items()
+                       if '.attn.' in k}
+        print0(f"NCA transfer (attn-only): preserving {len(block_state)} attention weight tensors, reinitializing MLPs")
+    else:
+        block_state = {k: v.clone() for k, v in model.state_dict().items()
+                       if '.attn.' in k or '.mlp.' in k}
+        print0(f"NCA transfer (full): preserving {len(block_state)} attention + MLP weight tensors")
 
     # Average weights across ranks
     if ddp:
@@ -102,7 +108,7 @@ def transfer_nca_to_text(model, saved, ddp=False):
 
 def run_nca_stage(model, nca_data_path, nca_lr, nca_batch_size,
                   seq_len, alphabet_size, ddp, ddp_rank, ddp_world_size, device, wandb_run,
-                  nca_steps=0):
+                  nca_steps=0, transfer_mode="full"):
     """Run the full NCA pre-pre-training stage.
 
     Loads pre-generated NCA data from disk. If nca_meta.json exists (epoch mode),
@@ -205,8 +211,7 @@ def run_nca_stage(model, nca_data_path, nca_lr, nca_batch_size,
     print0(f"NCA training complete: {global_step} steps across {epoch+1} epochs")
 
     # Transfer: keep attention + MLP, reinit embeddings/scalars
-    print0("NCA transfer: preserving attention + MLP weights, reinitializing embeddings/scalars")
-    transfer_nca_to_text(model, saved, ddp=ddp)
+    transfer_nca_to_text(model, saved, ddp=ddp, transfer_mode=transfer_mode)
 
     # Cleanup
     del nca_optimizer, nca_data

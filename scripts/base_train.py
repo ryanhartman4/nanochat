@@ -74,6 +74,7 @@ parser.add_argument("--nca-lr", type=float, default=1e-4, help="AdamW learning r
 parser.add_argument("--nca-batch-size", type=int, default=32, help="per-device batch size for NCA phase")
 parser.add_argument("--nca-alphabet-size", type=int, default=10, choices=[2, 4, 10], help="NCA alphabet size (default 10 matches paper; 2=16 tokens, 4=256 tokens, 10=10000 tokens)")
 parser.add_argument("--nca-steps", type=int, default=0, help="NCA training steps (legacy mode, 0 = use epoch mode from metadata)")
+parser.add_argument("--nca-transfer-mode", type=str, default="full", choices=["full", "attn-only"], help="Transfer mode: 'full' keeps attn+MLP (paper default), 'attn-only' keeps only attention weights")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -186,6 +187,7 @@ if args.nca_data and not resuming:
         device=device,
         wandb_run=wandb_run,
         nca_steps=args.nca_steps,
+        transfer_mode=args.nca_transfer_mode,
     )
     nca_wall_time = _time.time() - nca_t0
     print0(f"NCA wall time: {nca_wall_time:.1f}s ({nca_wall_time/60:.1f}m)")
