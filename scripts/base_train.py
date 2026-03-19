@@ -63,7 +63,7 @@ parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
-parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for AttnRes pseudo-queries")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -618,11 +618,12 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
-        # Log per-layer scalar values to track what the optimizer learns
+        # Log AttnRes query norms — track how each query specializes from zero-init
         raw_model = model.module if hasattr(model, 'module') else model
         for i in range(raw_model.config.n_layer):
-            log_data[f"scalars/x0_lambda_{i}"] = raw_model.x0_lambdas[i].item()
-            log_data[f"scalars/resid_lambda_{i}"] = raw_model.resid_lambdas[i].item()
+            log_data[f"attn_res/attn_query_norm_{i}"] = raw_model.attn_res_queries[2*i].norm().item()
+            log_data[f"attn_res/mlp_query_norm_{i}"] = raw_model.attn_res_queries[2*i+1].norm().item()
+        log_data["attn_res/final_query_norm"] = raw_model.attn_res_queries[-1].norm().item()
         wandb_run.log(log_data)
 
     # state update

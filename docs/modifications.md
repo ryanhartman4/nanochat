@@ -27,8 +27,8 @@ See [attention_explainer.html](attention_explainer.html) for an interactive comp
 
 1. ~~**A.2.1 Tokenizer** — Retrain existing BPE at 24K vocab~~ **REVERTED** (2026-03-16)
 2. ~~**A.2.2 NCA** — Pre-pre-training stage~~ **FAILED** (2026-03-17)
-3. **Idea #5: Prompt Re-Injection** — Quick d12 ablation: add input embedding at layer L/2. One line, 5 min. Tests whether fixed re-injection provides free gains.
-4. **Idea #3b: AttnRes** — Block Attention Residuals (N≈8). Learned version of #5. 1 day, 1.25x compute advantage. Zero-init = safe.
+3. ~~**Idea #5: Prompt Re-Injection** — x0 flat 1.0 init~~ **NO CHANGE** (2026-03-18). BPB identical to baseline.
+4. **Idea #3b: AttnRes** — Block Attention Residuals (N≈8). **IMPLEMENTED** (2026-03-18). Replaced resid_lambdas/x0_lambdas/backout_lambda with softmax attention over depth. Ready for GPU validation.
 5. **Idea #3a: DCA** — DeepCrossAttention (2-DCA). Stack on top of AttnRes. 1-2 days, 3x convergence claim. Complementary.
 6. **Idea #2: MoDA** — Mixture-of-Depths Attention. If AttnRes + DCA insufficient, add depth KV. Needs Triton kernel work, 2-3 days.
 7. Validate stacked changes on d12, then d24. Leaderboard submission.

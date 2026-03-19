@@ -91,6 +91,6 @@ AttnRes and DCA (arXiv:2502.06785) attack the same problem from similar angles. 
 - No kernel changes, pure PyTorch, torch.compile compatible
 - Single d-dimensional vector per layer — memory overhead is unmeasurable
 
-**Estimated integration effort:** 1 day for Block AttnRes. Simpler than DCA (fewer moving parts).
+**Status: IMPLEMENTED** (2026-03-18). Block AttnRes integrated into nanochat on `exp/attention_improvements` branch. Removed resid_lambdas, x0_lambdas, and backout_lambda (all subsumed). d12: N=4 blocks; d24: N=8 blocks. Ready for GPU validation.
 
-**Recommendation:** Implement AttnRes first (simpler, 1 day), then DCA on top. If AttnRes alone gives 1.25x, we'd hit ~79 min. If DCA stacks to give even partial additional gains, sub-1hr is achievable.
+**Next step:** Run d12 baseline comparison, then proceed to DCA if AttnRes shows the expected 1.25x compute advantage.

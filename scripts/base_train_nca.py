@@ -88,7 +88,7 @@ def transfer_nca_to_text(model, saved, ddp=False, transfer_mode="full"):
     """
     # Nanochat scalars that are co-adapted with attention weights during NCA training.
     # These are NOT vocab-dependent and should be preserved across transfer.
-    SCALAR_KEYS = {'resid_lambdas', 'x0_lambdas', 'smear_gate.weight', 'smear_lambda', 'backout_lambda'}
+    SCALAR_KEYS = {'attn_res_queries', 'smear_gate.weight', 'smear_lambda'}
 
     # Deep copy transformer block weights based on transfer mode
     if transfer_mode == "attn-only":
