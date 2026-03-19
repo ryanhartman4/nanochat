@@ -618,6 +618,11 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        # Log per-layer scalar values to track what the optimizer learns
+        raw_model = model.module if hasattr(model, 'module') else model
+        for i in range(raw_model.config.n_layer):
+            log_data[f"scalars/x0_lambda_{i}"] = raw_model.x0_lambdas[i].item()
+            log_data[f"scalars/resid_lambda_{i}"] = raw_model.resid_lambdas[i].item()
         wandb_run.log(log_data)
 
     # state update

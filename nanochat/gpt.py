@@ -234,9 +234,10 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         for i in range(n_layer):
             self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-        # Decaying x0 init: earlier layers get more input embedding blending
+        # x0 init: flat 1.0 — let the optimizer discover the ideal re-injection curve
+        # (Previous init was a prescribed linear decay 0.20→0.05. We want to learn the shape.)
         for i in range(n_layer):
-            self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+            self.x0_lambdas.data[i] = 1.0
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
