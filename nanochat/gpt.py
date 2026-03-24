@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # XSA (Exclusive Self-Attention): project out self-value component from attention output.
+    # -1 = disabled, 0 = all layers, N = layers [N, n_layer) only.
+    xsa_start_layer: int = -1
 
 
 def norm(x):
@@ -78,6 +81,8 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.use_xsa = config.xsa_start_layer >= 0 and layer_idx >= config.xsa_start_layer
+        self.n_head_repeat = self.n_head // self.n_kv_head  # for GQA expansion in XSA
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -119,6 +124,14 @@ class CausalSelfAttention(nn.Module):
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
+
+        # XSA: project out self-value component so attention only carries contextual info.
+        # Uses v AFTER value residual (ve) mixing — that's the v Flash Attention operated on.
+        # (arXiv:2603.09078, #1 on OpenAI Parameter Golf)
+        if self.use_xsa:
+            v_xsa = v.repeat_interleave(self.n_head_repeat, dim=2) if self.n_head_repeat > 1 else v
+            vn = F.normalize(v_xsa, dim=-1)
+            y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
